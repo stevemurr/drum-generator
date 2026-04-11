@@ -65,14 +65,14 @@ dit_epochs = 50
 
 ## 3. Train the VAE
 
-The VAE learns to compress DAC encoder latents (64×130) into a smaller space (16×130).
+The VAE learns to compress DAC encoder latents (64x130) into a smaller space (16x130).
 
-```bash
-# Point away from the Freesound data dir so only synthetic data is used
+```python
 python -c "
 from drum_generator.config import CFG
+from drum_generator.codec import encode_to_dac_latent
 from drum_generator.dataset import build_dataset
-from drum_generator.train import train_vae, encode_to_dac_latent, DEVICE
+from drum_generator.train import train_vae, DEVICE
 from torch.utils.data import DataLoader, random_split
 import os, torch
 
@@ -108,13 +108,13 @@ drum-train --phase vae
 
 ## 4. Train the DiT
 
-The DiT learns flow matching in the VAE latent space, conditioned on CLAP text embeddings.
+The DiT learns flow matching in the VAE latent space, conditioned on CLAP text embeddings and audio references. During training, each sample is paired with a random other sample from the batch as its reference. Reference conditioning is dropped 50% of the time so the model works well with text alone.
 
 ```python
 python -c "
 from drum_generator.config import CFG
 from drum_generator.dataset import build_dataset
-from drum_generator.train import train_dit, encode_to_dac_latent, DEVICE
+from drum_generator.train import train_dit, DEVICE
 from drum_generator.vae import DrumVAE
 from torch.utils.data import DataLoader, random_split
 import torch
@@ -155,7 +155,26 @@ drum-generate --prompt "closed hi-hat, bright, clean" --n 4
 
 Output files are saved as `generated_01.wav`, `generated_02.wav`, etc. in the current directory.
 
-## 6. Quick Sanity Check Script
+## 6. Reference-Conditioned Generation
+
+Provide a reference audio file to steer the tonal character of the output. The model uses the reference's spectral/tonal qualities while following the text prompt for what kind of sound to generate.
+
+```bash
+# Generate a snare that lives in the same "tonal universe" as your kick
+drum-generate --prompt "tight snare, crisp" --ref my_kick.wav --ref-cfg 2.0
+
+# Higher --ref-cfg = stronger tonal influence from reference
+drum-generate --prompt "closed hi-hat, bright" --ref my_kick.wav --ref-cfg 4.0
+
+# Lower --ref-cfg = subtler influence, text dominates
+drum-generate --prompt "snare, punchy" --ref my_kick.wav --ref-cfg 1.0
+```
+
+The reference audio is encoded through DAC and VAE into the same latent space the model operates in, then attended to via cross-attention at each transformer layer.
+
+You can use any audio file as reference — a synthetic preview from step 1, a Freesound sample from `data/`, or your own recordings.
+
+## 7. Quick Sanity Check Script
 
 Run the whole pipeline in miniature (tiny dataset, few epochs) to verify everything connects:
 
@@ -187,7 +206,7 @@ vae = DrumVAE().to(DEVICE)
 vae.load_state_dict(torch.load(f'{CFG.ckpt_dir}/vae_best.pt', map_location=DEVICE))
 train_dit(train_loader, val_loader, vae)
 
-print('=== Generate ===')
+print('=== Generate (text-only) ===')
 from drum_generator.generate import load_models, encode_prompt, decode_to_audio
 from drum_generator.dit import generate as fm_generate
 import numpy as np, scipy.io.wavfile as wavfile
@@ -208,6 +227,7 @@ print('Saved smoke_test.wav — pipeline works end to end')
 - **Dataset size**: 2000 synthetic samples with 2x augmentation multiplier gives 4000 effective training examples per epoch. For serious training, use 5000+ synthetic samples alongside real data.
 - **CLAP embeddings**: Pre-computed at dataset init time for synthetic sounds. First run takes ~30s for 2000 samples; subsequent items are instant.
 - **Augmentation**: Enabled by default. Applies random pitch shift, gain, noise, reverb, filtering, and polarity inversion. Disable with `augment=False` if you want to isolate training issues.
+- **Reference conditioning**: The DiT trains with audio references from the start (random batch pairings, 50% dropout). At inference, `--ref-cfg 0.0` disables reference influence entirely, matching text-only behavior.
 - **Combining sources**: Once you're satisfied with the pipeline, add real data:
   ```python
   ds = build_dataset(
