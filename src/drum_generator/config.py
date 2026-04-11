@@ -38,6 +38,8 @@ class Config:
     dit_epochs: int = 500
     cfg_dropout: float = 0.1  # prob of dropping text cond (CFG training)
     cfg_scale: float = 4.0  # guidance scale at inference
+    ref_dropout: float = 0.5  # prob of dropping audio reference (high → text-only works well)
+    ref_cfg_scale: float = 2.0  # guidance scale for reference at inference
 
     # Paths
     freesound_token: str = field(default_factory=lambda: os.environ.get("FREESOUND_TOKEN", ""))

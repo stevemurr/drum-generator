@@ -8,6 +8,7 @@ Architecture:
   - Patchify: merge patch_size=4 frames → tokens (B, T/4=32, 16*4=64)
   - N transformer blocks with AdaLN conditioning on (t_embed + clap_embed)
   - Cross-attention to CLAP text embedding
+  - Optional cross-attention to audio reference VAE latent
   - Linear head → velocity v (B, T/4, patch_dim) → unpatchify → (B, 16, T)
 
 Flow matching:
@@ -74,7 +75,7 @@ class AdaLN(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# DiT Block: AdaLN → self-attention → AdaLN → cross-attention → FFN
+# DiT Block: AdaLN → self-attn → cross-attn(CLAP) → cross-attn(ref) → FFN
 # ---------------------------------------------------------------------------
 
 
@@ -85,11 +86,14 @@ class DiTBlock(nn.Module):
         self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
 
         self.adaLN2 = AdaLN(dim, cond_dim)
-        # Cross-attention to CLAP text embedding
+        # Cross-attention to CLAP text embedding (kdim/vdim handle 512→256 projection)
         self.cross_attn = nn.MultiheadAttention(
             dim, heads, batch_first=True, kdim=clap_dim, vdim=clap_dim
         )
-        self.clap_proj = nn.Linear(clap_dim, dim)  # project keys/values
+
+        # Cross-attention to audio reference VAE latent
+        self.adaLN_ref = AdaLN(dim, cond_dim)
+        self.ref_cross_attn = nn.MultiheadAttention(dim, heads, batch_first=True)
 
         self.adaLN3 = AdaLN(dim, cond_dim)
         self.ffn = nn.Sequential(
@@ -98,21 +102,27 @@ class DiTBlock(nn.Module):
             nn.Linear(dim * 4, dim),
         )
 
-    def forward(self, x, cond, clap_kv):
+    def forward(self, x, cond, clap_kv, ref_kv=None):
         # x:       (B, T_tokens, dim)
         # cond:    (B, cond_dim)   — t_embed + clap_embed projected
         # clap_kv: (B, 1, clap_dim) — CLAP text embed as cross-attn key/value
+        # ref_kv:  (B, n_tokens, dim) or None — audio reference tokens
 
         # Self-attention
         h = self.adaLN1(x, cond)
         attn_out, _ = self.attn(h, h, h)
         x = x + attn_out
 
-        # Cross-attention to CLAP
+        # Cross-attention to CLAP (MHA projects 512→256 internally via kdim/vdim)
         h = self.adaLN2(x, cond)
-        kv = self.clap_proj(clap_kv)  # (B, 1, dim)
-        ca_out, _ = self.cross_attn(h, kv, kv)
+        ca_out, _ = self.cross_attn(h, clap_kv, clap_kv)
         x = x + ca_out
+
+        # Cross-attention to audio reference (when provided)
+        if ref_kv is not None:
+            h = self.adaLN_ref(x, cond)
+            ref_out, _ = self.ref_cross_attn(h, ref_kv, ref_kv)
+            x = x + ref_out
 
         # FFN
         h = self.adaLN3(x, cond)
@@ -145,6 +155,10 @@ class DrumDiT(nn.Module):
         # Positional embedding (learned)
         self.pos_embed = nn.Parameter(torch.randn(1, self.n_tokens, C.dit_dim) * 0.02)
 
+        # Audio reference embedding (separate from patch_embed)
+        self.ref_embed = nn.Linear(self.patch_dim, C.dit_dim)
+        self.ref_pos_embed = nn.Parameter(torch.randn(1, self.n_tokens, C.dit_dim) * 0.02)
+
         # Transformer blocks
         self.blocks = nn.ModuleList(
             [
@@ -161,6 +175,11 @@ class DrumDiT(nn.Module):
     def _init_weights(self):
         nn.init.zeros_(self.final_proj.weight)
         nn.init.zeros_(self.final_proj.bias)
+        # Zero-init reference cross-attention output so ref pathway starts
+        # with no contribution (backward compat with text-only checkpoints)
+        for block in self.blocks:
+            nn.init.zeros_(block.ref_cross_attn.out_proj.weight)
+            nn.init.zeros_(block.ref_cross_attn.out_proj.bias)
 
     def patchify(self, z: torch.Tensor) -> torch.Tensor:
         # z: (B, vae_latent_dim, T)
@@ -184,6 +203,7 @@ class DrumDiT(nn.Module):
         z_t: torch.Tensor,  # (B, vae_latent_dim, T) — noisy latent
         t: torch.Tensor,  # (B,) — timestep in [0,1]
         clap_embed: torch.Tensor,  # (B, clap_dim) — text conditioning
+        ref_z: torch.Tensor | None = None,  # (B, vae_latent_dim, T) — reference latent
     ) -> torch.Tensor:
         # Build conditioning vector: t_embed + clap contribution
         t_emb = self.t_embed(t)  # (B, cond_dim)
@@ -193,13 +213,18 @@ class DrumDiT(nn.Module):
         # CLAP as cross-attention keys/values
         clap_kv = clap_embed.unsqueeze(1)  # (B, 1, clap_dim)
 
+        # Audio reference as cross-attention keys/values
+        ref_kv = None
+        if ref_z is not None:
+            ref_kv = self.ref_embed(self.patchify(ref_z)) + self.ref_pos_embed  # (B, n_tokens, dim)
+
         # Patchify + embed
         x = self.patchify(z_t)  # (B, n_tokens, patch_dim)
         x = self.patch_embed(x) + self.pos_embed  # (B, n_tokens, dit_dim)
 
         # Transformer blocks
         for block in self.blocks:
-            x = block(x, cond, clap_kv)
+            x = block(x, cond, clap_kv, ref_kv)
 
         x = self.final_norm(x)
         x = self.final_proj(x)  # (B, n_tokens, patch_dim)
@@ -216,7 +241,9 @@ def flow_matching_loss(
     dit: DrumDiT,
     x1: torch.Tensor,  # (B, 16, T) — clean VAE latent
     clap_embed: torch.Tensor,  # (B, 512)
+    ref_z: torch.Tensor | None = None,  # (B, 16, T) — reference VAE latent
     cfg_dropout: float = CFG.cfg_dropout,
+    ref_dropout: float = CFG.ref_dropout,
 ) -> torch.Tensor:
     B = x1.shape[0]
     device = x1.device
@@ -235,22 +262,37 @@ def flow_matching_loss(
         mask = (torch.rand(B, device=device) < cfg_dropout).float()
         clap_embed = clap_embed * (1 - mask[:, None])
 
-    v_pred = dit(x_t, t, clap_embed)
+    # Independent dropout for audio reference
+    if ref_z is not None and ref_dropout > 0:
+        ref_mask = (torch.rand(B, device=device) < ref_dropout).float()
+        ref_z = ref_z * (1 - ref_mask[:, None, None])
+
+    v_pred = dit(x_t, t, clap_embed, ref_z=ref_z)
     return F.mse_loss(v_pred, v_target)
 
 
 @torch.no_grad()
 def generate(
     dit: DrumDiT,
-    clap_embed: torch.Tensor,  # (1, 512)
+    clap_embed: torch.Tensor,  # (B, 512)
+    ref_z: torch.Tensor | None = None,  # (B, vae_latent_dim, T) or None
     steps: int = CFG.fm_steps_infer,
     cfg_scale: float = CFG.cfg_scale,
+    ref_cfg_scale: float = CFG.ref_cfg_scale,
     device: str = "cpu",
 ) -> torch.Tensor:
-    """Euler ODE from pure noise to clean VAE latent, with CFG."""
+    """Euler ODE from pure noise to clean VAE latent, with composable CFG.
+
+    When ref_z is provided, uses three-way CFG:
+      v = v_uncond + cfg_scale * (v_text - v_uncond)
+                   + ref_cfg_scale * (v_both - v_text)
+
+    When ref_z is None, falls back to standard two-pass CFG.
+    """
     dit.eval()
     B = clap_embed.shape[0]
-    shape = (B, CFG.vae_latent_dim, CFG.dac_time_frames)
+    T = dit.n_tokens * dit.patch_size  # must be multiple of patch_size
+    shape = (B, CFG.vae_latent_dim, T)
     x = torch.randn(shape, device=device)
 
     null_embed = torch.zeros_like(clap_embed)  # unconditioned
@@ -259,9 +301,18 @@ def generate(
     for i in range(steps):
         t = torch.full((B,), i / steps, device=device)
 
-        v_cond = dit(x, t, clap_embed)
-        v_uncond = dit(x, t, null_embed)
-        v = v_uncond + cfg_scale * (v_cond - v_uncond)  # CFG
+        v_uncond = dit(x, t, null_embed, ref_z=None)
+        v_text = dit(x, t, clap_embed, ref_z=None)
+
+        if ref_z is not None:
+            v_both = dit(x, t, clap_embed, ref_z=ref_z)
+            v = (
+                v_uncond
+                + cfg_scale * (v_text - v_uncond)
+                + ref_cfg_scale * (v_both - v_text)
+            )
+        else:
+            v = v_uncond + cfg_scale * (v_text - v_uncond)
 
         x = x + v * dt
 

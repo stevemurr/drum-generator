@@ -2,7 +2,7 @@
 train.py
 --------
 Phase 1: Train VAE  (waveform → DAC latents → VAE latents → DAC latents)
-Phase 2: Train DiT  (flow matching in VAE latent space, CLAP conditioned)
+Phase 2: Train DiT  (flow matching in VAE latent space, CLAP + ref conditioned)
 
 Run:
     python train.py --phase vae
@@ -16,41 +16,13 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 
+from drum_generator.codec import encode_to_dac_latent
 from drum_generator.config import CFG
 from drum_generator.dataset import build_dataset
 from drum_generator.dit import DrumDiT, flow_matching_loss
 from drum_generator.vae import DrumVAE, vae_loss
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-# ---------------------------------------------------------------------------
-# DAC helper (lazy-loaded to avoid import cost if not needed)
-# ---------------------------------------------------------------------------
-
-_dac_model = None
-
-
-def get_dac():
-    global _dac_model
-    if _dac_model is None:
-        import dac
-
-        _dac_model = dac.DAC.load(dac.utils.download(model_type="44khz"))
-        _dac_model = _dac_model.to(DEVICE).eval()
-    return _dac_model
-
-
-def encode_to_dac_latent(waveform: torch.Tensor) -> torch.Tensor:
-    """
-    waveform: (B, N_SAMPLES) float32
-    returns:  (B, dac_latent_dim=64, T=130) continuous latent (pre-quantization)
-    """
-    dac = get_dac()
-    with torch.no_grad():
-        wav = waveform.unsqueeze(1).to(DEVICE)  # (B, 1, N)
-        z, _, _, _, _ = dac.encode(wav)  # continuous encoder output
-    return z  # (B, 64, T)
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +42,7 @@ def train_vae(train_loader, val_loader):
         train_loss = 0.0
         for wavs, _ in train_loader:  # ignore CLAP for VAE phase
             wavs = wavs.to(DEVICE)
-            dac_z = encode_to_dac_latent(wavs)  # (B, 64, T)
+            dac_z = encode_to_dac_latent(wavs, DEVICE)  # (B, 64, T)
 
             recon_z, mu, logvar, _ = vae(dac_z)
 
@@ -91,7 +63,7 @@ def train_vae(train_loader, val_loader):
         val_loss = 0.0
         with torch.no_grad():
             for wavs, _ in val_loader:
-                dac_z = encode_to_dac_latent(wavs.to(DEVICE))
+                dac_z = encode_to_dac_latent(wavs.to(DEVICE), DEVICE)
                 recon_z, mu, logvar, _ = vae(dac_z)
                 loss, _, _ = vae_loss(recon_z, dac_z, mu, logvar, 1e-4)
                 val_loss += loss.item()
@@ -109,6 +81,21 @@ def train_vae(train_loader, val_loader):
             print(f"  ✓ saved vae_best.pt")
 
     return vae
+
+
+# ---------------------------------------------------------------------------
+# Derangement helper (permutation with no fixed points)
+# ---------------------------------------------------------------------------
+
+
+def _derangement(n: int, device: str = "cpu") -> torch.Tensor:
+    """Random permutation where perm[i] != i for all i."""
+    perm = torch.randperm(n, device=device)
+    for i in range(n):
+        if perm[i] == i:
+            swap = (i + 1) % n
+            perm[i], perm[swap] = perm[swap].item(), perm[i].item()
+    return perm
 
 
 # ---------------------------------------------------------------------------
@@ -134,11 +121,21 @@ def train_dit(train_loader, val_loader, vae: DrumVAE):
 
             # Encode to VAE latent (no grad — VAE is frozen)
             with torch.no_grad():
-                dac_z = encode_to_dac_latent(wavs)  # (B, 64, T)
+                dac_z = encode_to_dac_latent(wavs, DEVICE)  # (B, 64, T)
                 mu, logvar = vae.encode(dac_z)
                 x1 = vae.reparameterize(mu, logvar)  # (B, 16, T)
 
-            loss = flow_matching_loss(dit, x1, clap_embeds, CFG.cfg_dropout)
+            # Create reference by shuffling batch (no self-reference)
+            B = x1.shape[0]
+            perm = _derangement(B, device=x1.device)
+            ref_z = x1[perm]  # (B, 16, T) — reuse already-computed latents
+
+            loss = flow_matching_loss(
+                dit, x1, clap_embeds,
+                ref_z=ref_z,
+                cfg_dropout=CFG.cfg_dropout,
+                ref_dropout=CFG.ref_dropout,
+            )
 
             opt.zero_grad()
             loss.backward()
@@ -155,10 +152,20 @@ def train_dit(train_loader, val_loader, vae: DrumVAE):
             for wavs, clap_embeds in val_loader:
                 wavs = wavs.to(DEVICE)
                 clap_embeds = clap_embeds.to(DEVICE)
-                dac_z = encode_to_dac_latent(wavs)
+                dac_z = encode_to_dac_latent(wavs, DEVICE)
                 mu, logvar = vae.encode(dac_z)
                 x1 = vae.reparameterize(mu, logvar)
-                loss = flow_matching_loss(dit, x1, clap_embeds, cfg_dropout=0.0)
+
+                B = x1.shape[0]
+                perm = _derangement(B, device=x1.device)
+                ref_z = x1[perm]
+
+                loss = flow_matching_loss(
+                    dit, x1, clap_embeds,
+                    ref_z=ref_z,
+                    cfg_dropout=0.0,
+                    ref_dropout=0.0,
+                )
                 val_loss += loss.item()
 
         train_loss /= len(train_loader)
