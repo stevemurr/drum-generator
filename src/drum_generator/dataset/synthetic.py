@@ -735,10 +735,11 @@ class SyntheticDrumDataset(Dataset):
         self.seed = seed
 
         # Pre-generate parameter table for reproducibility
+        # Round-robin across drum types for even coverage
         rng = np.random.RandomState(seed)
         self.params: list[dict] = []
-        for _ in range(size):
-            drum_type = DRUM_TYPES[rng.randint(len(DRUM_TYPES))]
+        for i in range(size):
+            drum_type = DRUM_TYPES[i % len(DRUM_TYPES)]
             available_chars = _TYPE_CHARS.get(drum_type, [])
             n_chars = min(rng.randint(1, 4), len(available_chars))
             chosen = list(rng.choice(available_chars, n_chars, replace=False))
