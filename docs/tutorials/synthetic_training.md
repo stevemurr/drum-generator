@@ -17,12 +17,14 @@ python -c "import torch; print(torch.cuda.is_available())"
 
 ## 1. Explore the Synthetic Dataset
 
-Generate a few samples to see what you're working with:
+The dataset cycles through all 8 drum types in round-robin order (kick, snare, hihat closed/open, clap, tom, rimshot, cymbal), generating variations of each with randomized synthesis parameters. Characteristic tags like "punchy", "distorted", or "warm" directly shape the sound — controlling attack time, waveshaping drive, pitch ranges, and more.
+
+Generate a set of samples to see what you're working with:
 
 ```python
 from drum_generator.dataset.synthetic import SyntheticDrumDataset
 
-ds = SyntheticDrumDataset(size=8, seed=42)
+ds = SyntheticDrumDataset(size=16, seed=42)  # 2 variations per drum type
 for i in range(len(ds)):
     wav, emb = ds[i]
     p = ds.params[i]
@@ -36,12 +38,13 @@ import scipy.io.wavfile as wavfile
 import numpy as np
 from drum_generator.config import CFG
 
-ds = SyntheticDrumDataset(size=8, seed=42)
+ds = SyntheticDrumDataset(size=16, seed=42)
 for i in range(len(ds)):
     wav, _ = ds[i]
     audio = (wav.numpy() * 32767).astype(np.int16)
-    wavfile.write(f"synth_preview_{i}.wav", CFG.sample_rate, audio)
-    print(f"saved synth_preview_{i}.wav — {ds.params[i]['drum_type']}")
+    fname = f"synth_preview_{ds.params[i]['drum_type']}_{i}.wav"
+    wavfile.write(fname, CFG.sample_rate, audio)
+    print(f"saved {fname}")
 ```
 
 ## 2. Configure for Synthetic-Only Training
@@ -223,8 +226,8 @@ print('Saved smoke_test.wav — pipeline works end to end')
 
 ## Notes
 
-- **Synthetic quality**: These are basic sine/noise synthesized drums. They won't sound like real recordings, but they exercise the full model pipeline. Mix in real samples (Freesound or your own via `disk_dirs`) for better results.
-- **Dataset size**: 2000 synthetic samples with 2x augmentation multiplier gives 4000 effective training examples per epoch. For serious training, use 5000+ synthetic samples alongside real data.
+- **Synthetic quality**: Synthesis uses ADSR envelopes, tanh waveshaping, inharmonic metallic partials (physical cymbal ratios), comb-filtered snare wires, and reverb convolution. Characteristic tags directly control parameters — "punchy" means faster attack, "distorted" means higher waveshaping drive, "sub" means lower pitch target. They won't match real recordings, but they provide musically meaningful training signal. Mix in real samples for best results.
+- **Dataset size**: 2000 synthetic samples with 2x augmentation multiplier gives 4000 effective training examples per epoch, with even coverage across all 8 drum types (250 each). For serious training, use 5000+ synthetic samples alongside real data.
 - **CLAP embeddings**: Pre-computed at dataset init time for synthetic sounds. First run takes ~30s for 2000 samples; subsequent items are instant.
 - **Augmentation**: Enabled by default. Applies random pitch shift, gain, noise, reverb, filtering, and polarity inversion. Disable with `augment=False` if you want to isolate training issues.
 - **Reference conditioning**: The DiT trains with audio references from the start (random batch pairings, 50% dropout). At inference, `--ref-cfg 0.0` disables reference influence entirely, matching text-only behavior.
