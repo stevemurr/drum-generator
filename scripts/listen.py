@@ -83,7 +83,7 @@ def build_page(directory: str) -> str:
     <div class="upload-zone" id="dropzone">
         <p>Drop audio files or a .zip here, or click to browse</p>
         <p class="hint">Accepts {', '.join(sorted(AUDIO_EXTS))} — folders via .zip</p>
-        <input type="file" id="fileinput" multiple accept="{','.join(sorted(AUDIO_EXTS))},.zip">
+        <input type="file" id="fileinput" multiple>
     </div>
     <div class="progress-bar" id="progressbar"><div class="fill" id="progressfill"></div></div>
     <div class="upload-status" id="status"></div>
@@ -197,10 +197,12 @@ class Handler(SimpleHTTPRequestHandler):
             self._json_response(400, {"error": "Expected multipart/form-data"})
             return
 
-        # Parse boundary
-        boundary = content_type.split("boundary=")[-1].encode()
+        # Save the raw upload to a temp file, then figure out what it is
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
+
+        # Parse boundary (may have quotes)
+        boundary = content_type.split("boundary=")[-1].strip().strip('"').encode()
 
         # Extract file from multipart
         filename, filedata = self._parse_multipart(body, boundary)
@@ -209,6 +211,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         ext = os.path.splitext(filename)[1].lower()
+        print(f"[upload] received: {filename} ({len(filedata)} bytes, ext={ext})")
 
         if ext == ".zip":
             count = self._handle_zip(filedata)
@@ -218,7 +221,7 @@ class Handler(SimpleHTTPRequestHandler):
             dest = os.path.join(self.server.audio_dir, safe_name)
             with open(dest, "wb") as f:
                 f.write(filedata)
-            print(f"[upload] {safe_name}")
+            print(f"[upload] saved {safe_name}")
             self._json_response(200, {"status": "ok", "file": safe_name})
         else:
             self._json_response(400, {"error": f"Unsupported file type: {ext}"})
@@ -245,25 +248,43 @@ class Handler(SimpleHTTPRequestHandler):
         return count
 
     def _parse_multipart(self, body: bytes, boundary: bytes) -> tuple[str | None, bytes | None]:
-        """Minimal multipart parser — extracts first file."""
-        parts = body.split(b"--" + boundary)
-        for part in parts:
-            if b"filename=" not in part:
-                continue
-            header_end = part.find(b"\r\n\r\n")
-            if header_end < 0:
-                continue
-            header = part[:header_end].decode(errors="replace")
-            # Extract filename
-            for segment in header.split(";"):
-                segment = segment.strip()
-                if segment.startswith("filename="):
-                    filename = segment.split("=", 1)[1].strip('"')
-                    filedata = part[header_end + 4:]
-                    # Trim trailing \r\n
-                    if filedata.endswith(b"\r\n"):
-                        filedata = filedata[:-2]
-                    return filename, filedata
+        """Minimal multipart parser — extracts first file.
+
+        Multipart format: each part is between --boundary markers,
+        with headers separated from body by \\r\\n\\r\\n. The body
+        ends with \\r\\n before the next --boundary.
+        """
+        delim = b"--" + boundary
+        # Find the part containing a file
+        start = body.find(delim)
+        while start >= 0:
+            # Find end of this part (next boundary)
+            part_start = start + len(delim)
+            part_end = body.find(delim, part_start)
+            if part_end < 0:
+                part_end = len(body)
+
+            part = body[part_start:part_end]
+
+            if b"filename=" in part:
+                header_end = part.find(b"\r\n\r\n")
+                if header_end < 0:
+                    start = part_end
+                    continue
+                header = part[:header_end].decode(errors="replace")
+                filedata = part[header_end + 4:]
+                # Remove the trailing \r\n that precedes the next boundary
+                if filedata.endswith(b"\r\n"):
+                    filedata = filedata[:-2]
+
+                for segment in header.split(";"):
+                    segment = segment.strip()
+                    if segment.startswith("filename="):
+                        filename = segment.split("=", 1)[1].strip('" ')
+                        return filename, filedata
+
+            start = part_end
+
         return None, None
 
     def _json_response(self, code: int, data: dict):
