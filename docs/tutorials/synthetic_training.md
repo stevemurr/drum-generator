@@ -66,14 +66,30 @@ vae_epochs = 20
 dit_epochs = 50
 ```
 
-## 3. Train the VAE
+## 3. Pre-encode DAC Latents (optional but recommended)
 
-The VAE learns to compress DAC encoder latents (64x130) into a smaller space (16x130).
+DAC encoding is the biggest per-batch bottleneck — it's a full neural network forward pass on every sample, every epoch, and the output never changes. Pass `cache=True` to encode everything once upfront:
+
+```python
+ds = build_dataset(
+    freesound_dir=None,
+    synthetic_size=2000,
+    augment=True,
+    augment_multiplier=2,
+    cache=True,                 # pre-encode through DAC, save to disk
+    cache_dir="cache",          # default location
+)
+```
+
+First run encodes all samples through DAC and saves `(dac_latent, clap_embed)` pairs to disk (~35KB each). Subsequent runs load directly from cache — no DAC model needed. The cache auto-rebuilds if the dataset size changes.
+
+## 4. Train the VAE
+
+The VAE learns to compress DAC encoder latents (1024x129) into a smaller space (16x129) via gradual channel reduction (1024 → 512 → 256 → 128 → 16).
 
 ```python
 python -c "
 from drum_generator.config import CFG
-from drum_generator.codec import encode_to_dac_latent
 from drum_generator.dataset import build_dataset
 from drum_generator.train import train_vae, DEVICE
 from torch.utils.data import DataLoader, random_split
@@ -89,6 +105,7 @@ ds = build_dataset(
     synthetic_size=2000,
     augment=True,
     augment_multiplier=2,
+    cache=True,                # pre-encode DAC latents
 )
 print(f'Dataset size: {len(ds)}')
 
@@ -109,7 +126,7 @@ Or more concisely via the CLI after temporarily editing config.py:
 drum-train --phase vae
 ```
 
-## 4. Train the DiT
+## 5. Train the DiT
 
 The DiT learns flow matching in the VAE latent space, conditioned on CLAP text embeddings and audio references. During training, each sample is paired with a random other sample from the batch as its reference. Reference conditioning is dropped 50% of the time so the model works well with text alone.
 
@@ -129,6 +146,7 @@ ds = build_dataset(
     synthetic_size=2000,
     augment=True,
     augment_multiplier=2,
+    cache=True,                # reuses the same cache from VAE phase
 )
 
 n_val = max(1, int(len(ds) * 0.1))
@@ -146,7 +164,7 @@ print('DiT training complete — saved checkpoints/dit_best.pt')
 "
 ```
 
-## 5. Generate Drum Sounds
+## 6. Generate Drum Sounds
 
 Once both checkpoints exist, generate from text prompts:
 
@@ -158,7 +176,7 @@ drum-generate --prompt "closed hi-hat, bright, clean" --n 4
 
 Output files are saved as `generated_01.wav`, `generated_02.wav`, etc. in the current directory.
 
-## 6. Reference-Conditioned Generation
+## 7. Reference-Conditioned Generation
 
 Provide a reference audio file to steer the tonal character of the output. The model uses the reference's spectral/tonal qualities while following the text prompt for what kind of sound to generate.
 
@@ -177,7 +195,7 @@ The reference audio is encoded through DAC and VAE into the same latent space th
 
 You can use any audio file as reference — a synthetic preview from step 1, a Freesound sample from `data/`, or your own recordings.
 
-## 7. Quick Sanity Check Script
+## 8. Quick Sanity Check Script
 
 Run the whole pipeline in miniature (tiny dataset, few epochs) to verify everything connects:
 
@@ -228,8 +246,9 @@ print('Saved smoke_test.wav — pipeline works end to end')
 
 - **Synthetic quality**: Synthesis uses ADSR envelopes, tanh waveshaping, inharmonic metallic partials (physical cymbal ratios), comb-filtered snare wires, and reverb convolution. Characteristic tags directly control parameters — "punchy" means faster attack, "distorted" means higher waveshaping drive, "sub" means lower pitch target. They won't match real recordings, but they provide musically meaningful training signal. Mix in real samples for best results.
 - **Dataset size**: 2000 synthetic samples with 2x augmentation multiplier gives 4000 effective training examples per epoch, with even coverage across all 8 drum types (250 each). For serious training, use 5000+ synthetic samples alongside real data.
+- **DAC caching**: Pass `cache=True` to pre-encode all samples through DAC once. Eliminates the biggest per-batch bottleneck for both VAE and DiT training. Cache auto-rebuilds when dataset size changes. ~35KB per sample on disk.
 - **CLAP embeddings**: Pre-computed at dataset init time for synthetic sounds. First run takes ~30s for 2000 samples; subsequent items are instant.
-- **Augmentation**: Enabled by default. Applies random pitch shift, gain, noise, reverb, filtering, and polarity inversion. Disable with `augment=False` if you want to isolate training issues.
+- **Augmentation**: Enabled by default. Applies random pitch shift, gain, noise, reverb, filtering, and polarity inversion. With `cache=True`, augmented variants are baked into the cache — a fixed set of augmented samples rather than infinite random ones, but with `augment_multiplier=2` you get plenty of diversity.
 - **Reference conditioning**: The DiT trains with audio references from the start (random batch pairings, 50% dropout). At inference, `--ref-cfg 0.0` disables reference influence entirely, matching text-only behavior.
 - **Combining sources**: Once you're satisfied with the pipeline, add real data:
   ```python
