@@ -12,45 +12,61 @@ import torch
 # ---------------------------------------------------------------------------
 
 _dac_model = None
+_dac_device = None
 
 
-def get_dac(device: str = "cpu"):
+def _default_device() -> str:
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def get_dac(device: str | None = None):
     """Load DAC 44kHz model (singleton, lazy-loaded)."""
-    global _dac_model
+    global _dac_model, _dac_device
+    if device is None:
+        device = _default_device()
     if _dac_model is None:
         import dac
 
         _dac_model = dac.DAC.load(dac.utils.download(model_type="44khz"))
         _dac_model = _dac_model.to(device).eval()
+        _dac_device = device
+    elif _dac_device != device:
+        _dac_model = _dac_model.to(device)
+        _dac_device = device
     return _dac_model
 
 
-def encode_to_dac_latent(waveform: torch.Tensor, device: str = "cpu") -> torch.Tensor:
+def encode_to_dac_latent(waveform: torch.Tensor, device: str | None = None) -> torch.Tensor:
     """Encode waveforms to continuous DAC latents (pre-quantization).
 
     Args:
         waveform: (B, N_SAMPLES) float32
-        device: target device
+        device: target device (auto-detects CUDA if None)
 
     Returns:
-        (B, dac_latent_dim=64, T=~130) continuous latent
+        (B, 1024, ~129) continuous latent
     """
+    if device is None:
+        device = _default_device()
     dac_model = get_dac(device)
     with torch.no_grad():
         wav = waveform.unsqueeze(1).to(device)  # (B, 1, N)
         z, _, _, _, _ = dac_model.encode(wav)  # continuous encoder output
-    return z  # (B, 64, T)
+    return z  # (B, 1024, T)
 
 
-def decode_from_dac_latent(dac_z: torch.Tensor, device: str = "cpu") -> torch.Tensor:
+def decode_from_dac_latent(dac_z: torch.Tensor, device: str | None = None) -> torch.Tensor:
     """Decode continuous DAC latents back to waveforms.
 
     Args:
-        dac_z: (B, 64, T) continuous DAC latent
+        dac_z: (B, 1024, T) continuous DAC latent
+        device: target device (auto-detects CUDA if None)
 
     Returns:
         (B, N_SAMPLES) float32 waveform
     """
+    if device is None:
+        device = _default_device()
     dac_model = get_dac(device)
     with torch.no_grad():
         waveform = dac_model.decode(dac_z.to(device))  # (B, 1, N_SAMPLES)
