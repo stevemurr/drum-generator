@@ -57,15 +57,18 @@ class CachedDACDataset(Dataset):
 
     def _build_cache(self):
         """Encode all waveforms through DAC and save to disk."""
+        from tqdm import tqdm
+
         from drum_generator.codec import encode_to_dac_latent
 
         os.makedirs(self.cache_dir, exist_ok=True)
-        print(f"[cache] encoding {self._size} samples through DAC → {self.cache_dir}/")
 
         batch_size = 16
         waveforms = []
         clap_embeds = []
         indices = []
+
+        pbar = tqdm(total=self._size, desc="[cache] encoding DAC latents", unit="sample")
 
         for i in range(self._size):
             waveform, clap_embed = self.base[i]
@@ -83,13 +86,12 @@ class CachedDACDataset(Dataset):
                         self._item_path(idx),
                     )
 
+                pbar.update(len(waveforms))
                 waveforms.clear()
                 clap_embeds.clear()
                 indices.clear()
 
-                done = i + 1
-                if done % 256 == 0 or done == self._size:
-                    print(f"  [{done}/{self._size}]")
+        pbar.close()
 
         # Write metadata
         with open(self._meta_path(), "w") as f:
