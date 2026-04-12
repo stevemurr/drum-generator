@@ -207,13 +207,17 @@ class ClapEmbedder:
             cls._instance = cls()
         return cls._instance
 
-    def __init__(self):
+    def __init__(self, device: str | None = None):
         from transformers import ClapModel, ClapProcessor
 
-        print("[clap] loading CLAP model...")
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = device
+
+        print(f"[clap] loading CLAP model on {device}...")
         self.proc = ClapProcessor.from_pretrained("laion/larger_clap_general")
         self.model = ClapModel.from_pretrained("laion/larger_clap_general")
-        self.model.eval()
+        self.model.to(device).eval()
 
     def embed(self, caption: str, cache_path: str | None = None) -> torch.Tensor:
         """Compute CLAP text embedding, with optional file cache."""
@@ -221,11 +225,12 @@ class ClapEmbedder:
             return torch.load(cache_path, map_location="cpu", weights_only=True)
 
         inputs = self.proc(text=caption, return_tensors="pt", padding=True)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
         with torch.no_grad():
             out = self.model.get_text_features(**inputs)
             # transformers >=5: returns BaseModelOutputWithPooling
             emb = out.pooler_output if hasattr(out, "pooler_output") else out
-            emb = emb.squeeze(0)  # (512,)
+            emb = emb.squeeze(0).cpu()  # (512,) — return on CPU for storage
 
         if cache_path:
             torch.save(emb, cache_path)
