@@ -47,8 +47,8 @@ def train_vae(train_loader, val_loader):
 
             recon_z, mu, logvar, _ = vae(dac_z)
 
-            # KL warmup: ramp weight from 0 → 1e-4 over first 20 epochs
-            kl_w = min(1e-4, 1e-4 * epoch / 20)
+            # KL warmup: ramp weight from 0 → target over warmup period
+            kl_w = min(CFG.vae_kl_weight, CFG.vae_kl_weight * epoch / CFG.vae_kl_warmup)
             loss, recon, kl = vae_loss(recon_z, dac_z, mu, logvar, kl_w)
 
             opt.zero_grad()
@@ -67,7 +67,7 @@ def train_vae(train_loader, val_loader):
                 audio = audio.to(DEVICE)
                 dac_z = audio if audio.dim() == 3 else encode_to_dac_latent(audio, DEVICE)
                 recon_z, mu, logvar, _ = vae(dac_z)
-                loss, _, _ = vae_loss(recon_z, dac_z, mu, logvar, 1e-4)
+                loss, _, _ = vae_loss(recon_z, dac_z, mu, logvar, CFG.vae_kl_weight)
                 val_loss += loss.item()
 
         train_loss /= len(train_loader)

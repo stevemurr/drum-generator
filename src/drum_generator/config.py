@@ -35,6 +35,8 @@ class Config:
     batch_size: int = 16
     lr: float = 1e-4
     vae_epochs: int = 100
+    vae_kl_weight: float = 1e-2  # KL regularization strength (higher = smoother latent space)
+    vae_kl_warmup: int = 20  # epochs to ramp KL weight from 0 → vae_kl_weight
     dit_epochs: int = 500
     cfg_dropout: float = 0.1  # prob of dropping text cond (CFG training)
     cfg_scale: float = 4.0  # guidance scale at inference
