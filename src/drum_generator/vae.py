@@ -5,7 +5,7 @@ vae.py
 into a smaller continuous latent (16 ch × 129 frames) for the DiT.
 
 Gradual channel compression: 1024 → 512 → 256 → 128 → 16
-Each stage does a comfortable 2-4x reduction with residual blocks.
+Each stage uses 3 residual blocks for richer feature learning.
 
 Flow:
   waveform → [DAC encoder] → dac_z (1024×129) → [VAE encoder] → mu, logvar
@@ -18,6 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from drum_generator.config import CFG
+
+BLOCKS_PER_STAGE = 3
 
 
 class ResBlock1d(nn.Module):
@@ -38,9 +40,15 @@ class ResBlock1d(nn.Module):
         return self.act(x + self.net(x))
 
 
+def _res_stack(ch: int, n: int = BLOCKS_PER_STAGE) -> nn.Sequential:
+    """Stack of N residual blocks at the same channel width."""
+    return nn.Sequential(*[ResBlock1d(ch) for _ in range(n)])
+
+
 class VAEEncoder(nn.Module):
     """
     Gradual channel compression: 1024 → 512 → 256 → 128 → 16
+    3 residual blocks per stage.
     Input:  (B, 1024, T=129)
     Output: mu (B, 16, T), logvar (B, 16, T)
     """
@@ -53,15 +61,15 @@ class VAEEncoder(nn.Module):
             # 1024 → 512
             nn.Conv1d(CFG.dac_latent_dim, H, 3, padding=1),
             nn.SiLU(),
-            ResBlock1d(H),
+            _res_stack(H),
             # 512 → 256
             nn.Conv1d(H, H // 2, 3, padding=1),
             nn.SiLU(),
-            ResBlock1d(H // 2),
+            _res_stack(H // 2),
             # 256 → 128
             nn.Conv1d(H // 2, H // 4, 3, padding=1),
             nn.SiLU(),
-            ResBlock1d(H // 4),
+            _res_stack(H // 4),
         )
         mid = H // 4  # 128
         self.mu_head = nn.Conv1d(mid, CFG.vae_latent_dim, 1)
@@ -77,6 +85,7 @@ class VAEEncoder(nn.Module):
 class VAEDecoder(nn.Module):
     """
     Mirror of encoder: 16 → 128 → 256 → 512 → 1024
+    3 residual blocks per stage.
     Input:  (B, 16, T=129)
     Output: (B, 1024, T)
     """
@@ -89,15 +98,15 @@ class VAEDecoder(nn.Module):
             # 16 → 128
             nn.Conv1d(CFG.vae_latent_dim, H // 4, 3, padding=1),
             nn.SiLU(),
-            ResBlock1d(H // 4),
+            _res_stack(H // 4),
             # 128 → 256
             nn.Conv1d(H // 4, H // 2, 3, padding=1),
             nn.SiLU(),
-            ResBlock1d(H // 2),
+            _res_stack(H // 2),
             # 256 → 512
             nn.Conv1d(H // 2, H, 3, padding=1),
             nn.SiLU(),
-            ResBlock1d(H),
+            _res_stack(H),
             # 512 → 1024
             nn.Conv1d(H, CFG.dac_latent_dim, 1),
         )
