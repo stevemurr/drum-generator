@@ -20,11 +20,13 @@ from drum_generator.config import CFG
 class CachedDACDataset(Dataset):
     """Pre-encodes waveforms through DAC and caches to disk.
 
-    Returns (dac_latent [64, 130], clap_embed [512]) instead of
+    Returns (dac_latent [1024, 129], clap_embed [512]) instead of
     (waveform [66150], clap_embed [512]).
     """
 
-    def __init__(self, base_dataset: Dataset, cache_dir: str, device: str = "cpu"):
+    def __init__(self, base_dataset: Dataset, cache_dir: str, device: str | None = None):
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         self.base = base_dataset
         self.cache_dir = cache_dir
         self.device = device
