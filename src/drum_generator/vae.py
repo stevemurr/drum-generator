@@ -1,12 +1,15 @@
 """
 vae.py
 ------
-1D-CNN VAE that compresses DAC encoder latents (64 ch × 130 frames)
-into a smaller continuous latent (16 ch × 130 frames) for the DiT.
+1D-CNN VAE that compresses DAC encoder latents (1024 ch × 129 frames)
+into a smaller continuous latent (16 ch × 129 frames) for the DiT.
+
+Gradual channel compression: 1024 → 512 → 256 → 128 → 16
+Each stage does a comfortable 2-4x reduction with residual blocks.
 
 Flow:
-  waveform → [DAC encoder] → dac_z (64×130) → [VAE encoder] → mu, logvar
-  z = mu + eps*std  →  [VAE decoder] → dac_z_hat (64×130)
+  waveform → [DAC encoder] → dac_z (1024×129) → [VAE encoder] → mu, logvar
+  z = mu + eps*std  →  [VAE decoder] → dac_z_hat (1024×129)
   dac_z_hat → [DAC decoder] → waveform_hat
 """
 
@@ -37,22 +40,30 @@ class ResBlock1d(nn.Module):
 
 class VAEEncoder(nn.Module):
     """
-    Input:  (B, dac_latent_dim=64, T=130)
-    Output: mu (B, vae_latent_dim=16, T), logvar (B, 16, T)
+    Gradual channel compression: 1024 → 512 → 256 → 128 → 16
+    Input:  (B, 1024, T=129)
+    Output: mu (B, 16, T), logvar (B, 16, T)
     """
 
     def __init__(self):
         super().__init__()
+        H = CFG.vae_hidden  # 512
+
         self.net = nn.Sequential(
-            nn.Conv1d(CFG.dac_latent_dim, CFG.vae_hidden, 3, padding=1),
+            # 1024 → 512
+            nn.Conv1d(CFG.dac_latent_dim, H, 3, padding=1),
             nn.SiLU(),
-            ResBlock1d(CFG.vae_hidden),
-            ResBlock1d(CFG.vae_hidden),
-            nn.Conv1d(CFG.vae_hidden, CFG.vae_hidden // 2, 3, padding=1),
+            ResBlock1d(H),
+            # 512 → 256
+            nn.Conv1d(H, H // 2, 3, padding=1),
             nn.SiLU(),
-            ResBlock1d(CFG.vae_hidden // 2),
+            ResBlock1d(H // 2),
+            # 256 → 128
+            nn.Conv1d(H // 2, H // 4, 3, padding=1),
+            nn.SiLU(),
+            ResBlock1d(H // 4),
         )
-        mid = CFG.vae_hidden // 2
+        mid = H // 4  # 128
         self.mu_head = nn.Conv1d(mid, CFG.vae_latent_dim, 1)
         self.logvar_head = nn.Conv1d(mid, CFG.vae_latent_dim, 1)
 
@@ -65,23 +76,30 @@ class VAEEncoder(nn.Module):
 
 class VAEDecoder(nn.Module):
     """
-    Input:  (B, vae_latent_dim=16, T=130)
-    Output: (B, dac_latent_dim=64, T)
+    Mirror of encoder: 16 → 128 → 256 → 512 → 1024
+    Input:  (B, 16, T=129)
+    Output: (B, 1024, T)
     """
 
     def __init__(self):
         super().__init__()
-        mid = CFG.vae_hidden // 2
+        H = CFG.vae_hidden  # 512
+
         self.net = nn.Sequential(
-            nn.Conv1d(CFG.vae_latent_dim, mid, 3, padding=1),
+            # 16 → 128
+            nn.Conv1d(CFG.vae_latent_dim, H // 4, 3, padding=1),
             nn.SiLU(),
-            ResBlock1d(mid),
-            ResBlock1d(mid),
-            nn.Conv1d(mid, CFG.vae_hidden, 3, padding=1),
+            ResBlock1d(H // 4),
+            # 128 → 256
+            nn.Conv1d(H // 4, H // 2, 3, padding=1),
             nn.SiLU(),
-            ResBlock1d(CFG.vae_hidden),
-            ResBlock1d(CFG.vae_hidden),
-            nn.Conv1d(CFG.vae_hidden, CFG.dac_latent_dim, 1),
+            ResBlock1d(H // 2),
+            # 256 → 512
+            nn.Conv1d(H // 2, H, 3, padding=1),
+            nn.SiLU(),
+            ResBlock1d(H),
+            # 512 → 1024
+            nn.Conv1d(H, CFG.dac_latent_dim, 1),
         )
 
     def forward(self, z):

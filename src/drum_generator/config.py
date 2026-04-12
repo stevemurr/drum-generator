@@ -9,14 +9,14 @@ class Config:
     duration: float = 1.5  # seconds — covers all one-shots
     n_samples: int = 66150  # sample_rate * duration
 
-    # DAC latent shape (Descript Audio Codec)
-    # encoder compresses 512x → latent dim 64, ~130 frames for 1.5s
-    dac_latent_dim: int = 64
-    dac_time_frames: int = 130  # ceil(n_samples / 512)
+    # DAC latent shape (Descript Audio Codec 44kHz)
+    # encoder outputs 1024-dim continuous latent, ~129 frames for 1.5s
+    dac_latent_dim: int = 1024
+    dac_time_frames: int = 129  # floor(n_samples / 512)
 
     # VAE (compresses DAC latents further for DiT to work in)
     vae_latent_dim: int = 16  # per time frame
-    vae_hidden: int = 256
+    vae_hidden: int = 512  # base hidden dim for gradual compression
 
     # CLAP text embedding dim (laion/larger_clap_general)
     clap_dim: int = 512
@@ -25,7 +25,7 @@ class Config:
     dit_dim: int = 256  # transformer hidden dim
     dit_heads: int = 8
     dit_layers: int = 6
-    dit_patch_size: int = 4  # merge 4 time frames per token → ~32 tokens
+    dit_patch_size: int = 3  # merge 3 time frames per token → 43 tokens
 
     # Flow matching
     fm_steps_train: int = 1  # CFM samples one t per step
@@ -60,6 +60,10 @@ class Config:
     augment_p: float = 0.5  # per-transform probability
     augment_multiplier: int = 1  # effective dataset size multiplier
     clap_cache_dir: str | None = None
+
+    # DAC latent caching
+    cache: bool = False  # pre-encode all samples through DAC
+    dac_cache_dir: str = "cache"
 
 
 CFG = Config()

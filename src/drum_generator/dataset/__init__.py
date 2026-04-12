@@ -16,6 +16,7 @@ from torch.utils.data import ConcatDataset, Dataset
 
 from drum_generator.config import CFG
 from drum_generator.dataset.augment import AugmentedDataset, build_transforms
+from drum_generator.dataset.cache import CachedDACDataset
 from drum_generator.dataset.caption import ClapEmbedder
 from drum_generator.dataset.disk import DiskAudioDataset
 from drum_generator.dataset.freesound import FreesoundDataset, cli_download, download_dataset
@@ -31,6 +32,7 @@ __all__ = [
     "DiskAudioDataset",
     "SyntheticDrumDataset",
     "AugmentedDataset",
+    "CachedDACDataset",
     "ClapEmbedder",
     "download_dataset",
     "cli_download",
@@ -48,8 +50,13 @@ def build_dataset(
     augment_p: float | None = None,
     augment_multiplier: int | None = None,
     clap_cache_dir: str | None = None,
+    cache: bool | None = None,
+    cache_dir: str | None = None,
 ) -> Dataset:
     """Build a combined dataset from all configured sources + augmentation.
+
+    When cache=True, pre-encodes all samples through DAC and caches to disk.
+    Returns (dac_latent, clap_embed) instead of (waveform, clap_embed).
 
     Parameters fall back to CFG defaults when not specified.
     """
@@ -63,7 +70,9 @@ def build_dataset(
     aug_transform_names = augment_transforms if augment_transforms is not None else CFG.augment_transforms
     aug_p = augment_p if augment_p is not None else CFG.augment_p
     aug_multiplier = augment_multiplier if augment_multiplier is not None else CFG.augment_multiplier
-    cache_dir = clap_cache_dir if clap_cache_dir is not None else CFG.clap_cache_dir
+    clap_dir = clap_cache_dir if clap_cache_dir is not None else CFG.clap_cache_dir
+    do_cache = cache if cache is not None else CFG.cache
+    dac_cache_dir = cache_dir if cache_dir is not None else CFG.dac_cache_dir
 
     clap = ClapEmbedder.get()
     sources: list[Dataset] = []
@@ -82,7 +91,7 @@ def build_dataset(
                 DiskAudioDataset(
                     root_dirs=valid_dirs,
                     clap_embedder=clap,
-                    cache_dir=cache_dir,
+                    cache_dir=clap_dir,
                     label_file=disk_label_file,
                 )
             )
@@ -116,5 +125,9 @@ def build_dataset(
                 p_each=aug_p,
                 multiplier=aug_multiplier,
             )
+
+    # 5. DAC latent caching
+    if do_cache:
+        combined = CachedDACDataset(combined, dac_cache_dir)
 
     return combined

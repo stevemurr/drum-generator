@@ -40,9 +40,10 @@ def train_vae(train_loader, val_loader):
         # --- train ---
         vae.train()
         train_loss = 0.0
-        for wavs, _ in train_loader:  # ignore CLAP for VAE phase
-            wavs = wavs.to(DEVICE)
-            dac_z = encode_to_dac_latent(wavs, DEVICE)  # (B, 64, T)
+        for audio, _ in train_loader:  # ignore CLAP for VAE phase
+            audio = audio.to(DEVICE)
+            # Detect cached DAC latents (3D) vs raw waveforms (2D)
+            dac_z = audio if audio.dim() == 3 else encode_to_dac_latent(audio, DEVICE)
 
             recon_z, mu, logvar, _ = vae(dac_z)
 
@@ -62,8 +63,9 @@ def train_vae(train_loader, val_loader):
         vae.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for wavs, _ in val_loader:
-                dac_z = encode_to_dac_latent(wavs.to(DEVICE), DEVICE)
+            for audio, _ in val_loader:
+                audio = audio.to(DEVICE)
+                dac_z = audio if audio.dim() == 3 else encode_to_dac_latent(audio, DEVICE)
                 recon_z, mu, logvar, _ = vae(dac_z)
                 loss, _, _ = vae_loss(recon_z, dac_z, mu, logvar, 1e-4)
                 val_loss += loss.item()
@@ -115,13 +117,13 @@ def train_dit(train_loader, val_loader, vae: DrumVAE):
         # --- train ---
         dit.train()
         train_loss = 0.0
-        for wavs, clap_embeds in train_loader:
-            wavs = wavs.to(DEVICE)
+        for audio, clap_embeds in train_loader:
+            audio = audio.to(DEVICE)
             clap_embeds = clap_embeds.to(DEVICE)
 
             # Encode to VAE latent (no grad — VAE is frozen)
             with torch.no_grad():
-                dac_z = encode_to_dac_latent(wavs, DEVICE)  # (B, 64, T)
+                dac_z = audio if audio.dim() == 3 else encode_to_dac_latent(audio, DEVICE)
                 mu, logvar = vae.encode(dac_z)
                 x1 = vae.reparameterize(mu, logvar)  # (B, 16, T)
 
@@ -149,10 +151,10 @@ def train_dit(train_loader, val_loader, vae: DrumVAE):
         dit.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for wavs, clap_embeds in val_loader:
-                wavs = wavs.to(DEVICE)
+            for audio, clap_embeds in val_loader:
+                audio = audio.to(DEVICE)
                 clap_embeds = clap_embeds.to(DEVICE)
-                dac_z = encode_to_dac_latent(wavs, DEVICE)
+                dac_z = audio if audio.dim() == 3 else encode_to_dac_latent(audio, DEVICE)
                 mu, logvar = vae.encode(dac_z)
                 x1 = vae.reparameterize(mu, logvar)
 
