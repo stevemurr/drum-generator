@@ -304,6 +304,19 @@ def main():
              f"Roughly doubles per-step training cost when enabled. "
              f"Default: CFG.vae_stft_weight ({CFG.vae_stft_weight}).",
     )
+    parser.add_argument(
+        "--cudnn-benchmark",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="cuDNN algorithm benchmarking mode. 'on' (PyTorch default) times "
+             "multiple conv algorithms on first call per shape and caches the "
+             "fastest — ~15-30%% faster steady-state but causes a multi-minute "
+             "first-step stall for conv-heavy networks. 'off' uses a heuristic "
+             "instead — slightly slower steady-state but immediate start and "
+             "lower workspace memory. 'auto' = off when --vae-stft-weight > 0 "
+             "(DAC decoder has many shapes and GB10 benchmark payoff is low), "
+             "otherwise on. Default: auto.",
+    )
     args = parser.parse_args()
 
     if args.memmap_dir:
@@ -345,6 +358,20 @@ def main():
     if args.vae_stft_weight is not None:
         CFG.vae_stft_weight = args.vae_stft_weight
         print(f"[train] vae_stft_weight: {args.vae_stft_weight}")
+
+    # cuDNN benchmark mode. 'auto' = off when STFT loss is enabled (DAC decoder
+    # has many conv shapes and optimal GB10 kernels often aren't available, so
+    # benchmarking is wasted work and stalls first-step). 'on' | 'off' override.
+    if args.cudnn_benchmark == "on":
+        torch.backends.cudnn.benchmark = True
+        print("[train] cudnn.benchmark: on")
+    elif args.cudnn_benchmark == "off":
+        torch.backends.cudnn.benchmark = False
+        print("[train] cudnn.benchmark: off")
+    else:  # auto
+        auto_off = bool(CFG.vae_stft_weight and CFG.vae_stft_weight > 0)
+        torch.backends.cudnn.benchmark = not auto_off
+        print(f"[train] cudnn.benchmark: auto -> {'off' if auto_off else 'on'}")
 
     print(f"Training on {DEVICE}")
     os.makedirs(CFG.ckpt_dir, exist_ok=True)
