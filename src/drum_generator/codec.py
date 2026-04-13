@@ -55,19 +55,28 @@ def encode_to_dac_latent(waveform: torch.Tensor, device: str | None = None) -> t
     return z  # (B, 1024, T)
 
 
-def decode_from_dac_latent(dac_z: torch.Tensor, device: str | None = None) -> torch.Tensor:
+def decode_from_dac_latent(
+    dac_z: torch.Tensor,
+    device: str | None = None,
+    no_grad: bool = True,
+) -> torch.Tensor:
     """Decode continuous DAC latents back to waveforms.
 
     Args:
         dac_z: (B, 1024, T) continuous DAC latent
         device: target device (auto-detects CUDA if None)
+        no_grad: if True (default), wraps decode in torch.no_grad() — set
+            False when you need gradients to flow through the DAC decoder,
+            e.g., VAE training with an STFT loss computed in waveform space.
 
     Returns:
         (B, N_SAMPLES) float32 waveform
     """
+    import contextlib
     if device is None:
         device = _default_device()
     dac_model = get_dac(device)
-    with torch.no_grad():
+    ctx = torch.no_grad() if no_grad else contextlib.nullcontext()
+    with ctx:
         waveform = dac_model.decode(dac_z.to(device))  # (B, 1, N_SAMPLES)
     return waveform.squeeze(1)  # (B, N_SAMPLES)

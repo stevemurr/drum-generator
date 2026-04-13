@@ -12,6 +12,7 @@ dependencies = [
     "requests>=2.31.0",
     "descript-audio-codec>=1.0.0",
     "torchcodec>=0.11.0",
+    "auraloss>=0.4.0",
 ]
 
 [project.optional-dependencies]
