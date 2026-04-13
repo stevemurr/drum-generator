@@ -207,6 +207,27 @@ def main():
         help="Directory to save vae_best.pt / dit_best.pt. "
              f"Default: CFG.ckpt_dir ({CFG.ckpt_dir!r}, relative to cwd).",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help=f"Batch size for the DataLoader (applies to both VAE and DiT "
+             f"phases). Default: CFG.batch_size ({CFG.batch_size}).",
+    )
+    parser.add_argument(
+        "--vae-epochs",
+        type=int,
+        default=None,
+        help=f"Number of VAE training epochs. "
+             f"Default: CFG.vae_epochs ({CFG.vae_epochs}).",
+    )
+    parser.add_argument(
+        "--dit-epochs",
+        type=int,
+        default=None,
+        help=f"Number of DiT training epochs. "
+             f"Default: CFG.dit_epochs ({CFG.dit_epochs}).",
+    )
     args = parser.parse_args()
 
     if args.memmap_dir:
@@ -216,6 +237,18 @@ def main():
     if args.ckpt_dir:
         CFG.ckpt_dir = args.ckpt_dir
         print(f"[train] ckpt dir: {args.ckpt_dir}")
+
+    if args.batch_size is not None:
+        CFG.batch_size = args.batch_size
+        print(f"[train] batch_size: {args.batch_size}")
+
+    if args.vae_epochs is not None:
+        CFG.vae_epochs = args.vae_epochs
+        print(f"[train] vae_epochs: {args.vae_epochs}")
+
+    if args.dit_epochs is not None:
+        CFG.dit_epochs = args.dit_epochs
+        print(f"[train] dit_epochs: {args.dit_epochs}")
 
     print(f"Training on {DEVICE}")
     os.makedirs(CFG.ckpt_dir, exist_ok=True)
