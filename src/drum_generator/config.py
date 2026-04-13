@@ -63,9 +63,17 @@ class Config:
     augment_multiplier: int = 1  # effective dataset size multiplier
     clap_cache_dir: str | None = None
 
-    # DAC latent caching
+    # DAC latent caching (live path: encode on first access, store as .pt files)
     cache: bool = False  # pre-encode all samples through DAC
     dac_cache_dir: str = "cache"
+
+    # Precomputed memmap path (fast path: skips wav decode / DAC encode / CLAP
+    # entirely). When set, build_dataset() returns a MemmapDACDataset from
+    # this directory — must contain dac_latents.npy, embeddings_text.npy,
+    # index.json. Produced by the companion dataset-caption pipeline. No
+    # augmentation in memmap mode — use the live path if you need pitch shift
+    # / reverb / etc.
+    memmap_dir: str | None = None
 
 
 CFG = Config()

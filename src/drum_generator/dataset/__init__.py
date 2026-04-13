@@ -20,6 +20,7 @@ from drum_generator.dataset.cache import CachedDACDataset
 from drum_generator.dataset.caption import ClapEmbedder
 from drum_generator.dataset.disk import DiskAudioDataset
 from drum_generator.dataset.freesound import FreesoundDataset, cli_download, download_dataset
+from drum_generator.dataset.memmap import MemmapDACDataset
 from drum_generator.dataset.synthetic import SyntheticDrumDataset
 
 # Backward-compat alias
@@ -33,6 +34,7 @@ __all__ = [
     "SyntheticDrumDataset",
     "AugmentedDataset",
     "CachedDACDataset",
+    "MemmapDACDataset",
     "ClapEmbedder",
     "download_dataset",
     "cli_download",
@@ -52,14 +54,29 @@ def build_dataset(
     clap_cache_dir: str | None = None,
     cache: bool | None = None,
     cache_dir: str | None = None,
+    memmap_dir: str | None = None,
 ) -> Dataset:
     """Build a combined dataset from all configured sources + augmentation.
 
-    When cache=True, pre-encodes all samples through DAC and caches to disk.
-    Returns (dac_latent, clap_embed) instead of (waveform, clap_embed).
+    Two paths:
+      1. Memmap (fast): if CFG.memmap_dir (or the memmap_dir arg) is set,
+         return a MemmapDACDataset reading precomputed DAC + CLAP tensors.
+         No augmentation, no on-the-fly encoding. Produced by the
+         dataset-caption pipeline.
+      2. Live (flexible): walks freesound / disk / synthetic sources,
+         optionally wraps with AugmentedDataset and CachedDACDataset.
 
     Parameters fall back to CFG defaults when not specified.
     """
+    # Resolve the memmap path first — if set, short-circuit the whole
+    # flexible pipeline.
+    mm_dir = memmap_dir if memmap_dir is not None else CFG.memmap_dir
+    if mm_dir:
+        if augment is True or (augment is None and CFG.augment):
+            print("[dataset] memmap_dir is set; ignoring augment=True "
+                  "(memmap path cannot do waveform augmentation)")
+        return MemmapDACDataset(mm_dir)
+
     # Resolve defaults from CFG
     freesound_dir = freesound_dir if freesound_dir is not None else CFG.data_dir
     disk_dirs = disk_dirs if disk_dirs is not None else CFG.disk_dirs

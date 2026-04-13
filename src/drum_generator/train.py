@@ -193,7 +193,19 @@ def train_dit(train_loader, val_loader, vae: DrumVAE):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--phase", choices=["vae", "dit", "both"], default="both")
+    parser.add_argument(
+        "--memmap-dir",
+        default=None,
+        help="Directory containing precomputed dac_latents.npy + "
+             "embeddings_text.npy + index.json (from dataset-caption pipeline). "
+             "Skips wav decode / DAC encode / CLAP encode at training time. "
+             "Disables waveform augmentation.",
+    )
     args = parser.parse_args()
+
+    if args.memmap_dir:
+        CFG.memmap_dir = args.memmap_dir
+        print(f"[train] memmap mode: {args.memmap_dir}")
 
     print(f"Training on {DEVICE}")
     os.makedirs(CFG.ckpt_dir, exist_ok=True)
