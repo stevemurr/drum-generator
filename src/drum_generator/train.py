@@ -201,11 +201,21 @@ def main():
              "Skips wav decode / DAC encode / CLAP encode at training time. "
              "Disables waveform augmentation.",
     )
+    parser.add_argument(
+        "--ckpt-dir",
+        default=None,
+        help="Directory to save vae_best.pt / dit_best.pt. "
+             f"Default: CFG.ckpt_dir ({CFG.ckpt_dir!r}, relative to cwd).",
+    )
     args = parser.parse_args()
 
     if args.memmap_dir:
         CFG.memmap_dir = args.memmap_dir
         print(f"[train] memmap mode: {args.memmap_dir}")
+
+    if args.ckpt_dir:
+        CFG.ckpt_dir = args.ckpt_dir
+        print(f"[train] ckpt dir: {args.ckpt_dir}")
 
     print(f"Training on {DEVICE}")
     os.makedirs(CFG.ckpt_dir, exist_ok=True)
