@@ -11,6 +11,7 @@ Run:
 
 import argparse
 import os
+import time
 
 import torch
 import torch.nn as nn
@@ -148,6 +149,7 @@ def train_vae(train_loader, val_loader):
 
     best_val = float("inf")
     for epoch in range(1, CFG.vae_epochs + 1):
+        epoch_start = time.time()
         # --- train ---
         vae.train()
         train_loss = 0.0
@@ -186,9 +188,11 @@ def train_vae(train_loader, val_loader):
 
         train_loss /= len(train_loader)
         val_loss /= len(val_loader)
+        epoch_time = time.time() - epoch_start
         print(
             f"VAE epoch {epoch:3d}/{CFG.vae_epochs} | "
-            f"train {train_loss:.5f} | val {val_loss:.5f}"
+            f"train {train_loss:.5f} | val {val_loss:.5f} | "
+            f"time {epoch_time:.1f}s"
         )
 
         if val_loss < best_val:
@@ -228,6 +232,7 @@ def train_dit(train_loader, val_loader, vae: DrumVAE):
     best_val = float("inf")
 
     for epoch in range(1, CFG.dit_epochs + 1):
+        epoch_start = time.time()
         # --- train ---
         dit.train()
         train_loss = 0.0
@@ -284,9 +289,11 @@ def train_dit(train_loader, val_loader, vae: DrumVAE):
 
         train_loss /= len(train_loader)
         val_loss /= len(val_loader)
+        epoch_time = time.time() - epoch_start
         print(
             f"DiT epoch {epoch:3d}/{CFG.dit_epochs} | "
-            f"train {train_loss:.5f} | val {val_loss:.5f}"
+            f"train {train_loss:.5f} | val {val_loss:.5f} | "
+            f"time {epoch_time:.1f}s"
         )
 
         if val_loss < best_val:
