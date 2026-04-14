@@ -40,6 +40,9 @@ class Config:
     vae_stft_weight: float = 0.0  # linear multi-res STFT loss weight (0 disables)
     vae_stft_phase_weight: float = 0.0  # phase term (w_phs) inside the linear MRSTFT
     vae_stft_mel_weight: float = 0.0  # separate mel-scaled MRSTFT loss weight (0 disables)
+    vae_stft_weighted: bool = False  # use per-bin weighted linear MRSTFT (drum weight curve)
+    vae_lowpass_weight: float = 0.0  # L1 on lowpassed waveform, targets sub-cutoff content (0 disables)
+    vae_lowpass_cutoff: float = 500.0  # lowpass cutoff in Hz for the L1 term
     dit_epochs: int = 500
     cfg_dropout: float = 0.1  # prob of dropping text cond (CFG training)
     cfg_scale: float = 4.0  # guidance scale at inference

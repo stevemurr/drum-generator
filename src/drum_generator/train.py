@@ -15,6 +15,7 @@ import time
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 
 from drum_generator.codec import decode_from_dac_latent, encode_to_dac_latent, set_dac_optim
@@ -92,8 +93,141 @@ def _unpack_batch(batch, device):
     return audio, clap, wav_pre
 
 
+class WeightedMRSTFTLoss(nn.Module):
+    """Multi-resolution magnitude STFT loss with per-frequency-bin weighting.
+
+    At each FFT resolution, computes log-magnitude L1 and spectral
+    convergence, but multiplies each bin's error by a frequency-dependent
+    weight before reducing. A weight of 0 effectively masks a bin out.
+
+    This is a drop-in replacement for auraloss's MultiResolutionSTFTLoss
+    on the linear-frequency path, exposing the bin-weight axis that
+    auraloss doesn't. Mel remains handled by auraloss separately.
+    """
+
+    def __init__(
+        self,
+        fft_sizes: list[int],
+        hop_sizes: list[int],
+        win_lengths: list[int],
+        sample_rate: int,
+        weight_fn,  # callable: (n_bins, sample_rate) -> (n_bins,) tensor
+    ):
+        super().__init__()
+        self.fft_sizes = list(fft_sizes)
+        self.hop_sizes = list(hop_sizes)
+        self.win_lengths = list(win_lengths)
+        for i, (n_fft, win_len) in enumerate(zip(fft_sizes, win_lengths)):
+            self.register_buffer(f"window_{i}", torch.hann_window(win_len))
+            w = weight_fn(n_bins=n_fft // 2 + 1, sample_rate=sample_rate)
+            self.register_buffer(f"bin_weights_{i}", w)
+
+    def _mag(self, x: torch.Tensor, i: int) -> torch.Tensor:
+        return torch.stft(
+            x,
+            n_fft=self.fft_sizes[i],
+            hop_length=self.hop_sizes[i],
+            win_length=self.win_lengths[i],
+            window=getattr(self, f"window_{i}"),
+            return_complex=True,
+        ).abs()
+
+    def forward(self, wav_hat: torch.Tensor, wav_true: torch.Tensor) -> torch.Tensor:
+        # auraloss convention: (B, 1, T). Squeeze the channel dim for torch.stft.
+        if wav_hat.dim() == 3:
+            wav_hat = wav_hat.squeeze(1)
+        if wav_true.dim() == 3:
+            wav_true = wav_true.squeeze(1)
+
+        losses = []
+        for i in range(len(self.fft_sizes)):
+            weights = getattr(self, f"bin_weights_{i}").view(1, -1, 1)
+            mag_true = self._mag(wav_true, i)
+            mag_hat = self._mag(wav_hat, i)
+
+            log_true = torch.log(mag_true + 1e-7)
+            log_hat = torch.log(mag_hat + 1e-7)
+            log_mag = ((log_hat - log_true).abs() * weights).mean()
+
+            diff = (mag_true - mag_hat) * weights
+            ref = mag_true * weights
+            sc = diff.norm() / ref.norm().clamp(min=1e-7)
+
+            losses.append(log_mag + sc)
+        return torch.stack(losses).mean()
+
+
+def drum_weight_curve(n_bins: int, sample_rate: int) -> torch.Tensor:
+    """Per-bin frequency weights tuned for drum one-shots.
+
+    - 0x      below 20 Hz    (DC / sub-rumble — not drum content)
+    - 3x      40-320 Hz      (kick fundamental + first harmonics)
+    - 1x      320 Hz-15 kHz  (body, mid, attack, high detail)
+    - 1.0→0.1 above 15 kHz   (smooth rolloff — near noise floor)
+    """
+    freqs = torch.linspace(0, sample_rate / 2, n_bins)
+    weights = torch.ones(n_bins)
+
+    weights[freqs < 20] = 0.0
+
+    kick_band = (freqs >= 40) & (freqs <= 320)
+    weights[kick_band] = 3.0
+
+    rolloff = freqs > 15000
+    roll_frac = (freqs[rolloff] - 15000) / (sample_rate / 2 - 15000)
+    weights[rolloff] = 1.0 - 0.9 * roll_frac
+
+    return weights
+
+
+def _make_lowpass_fir(cutoff_hz: float, sample_rate: int, num_taps: int = 257) -> torch.Tensor:
+    """Linear-phase windowed-sinc FIR lowpass kernel.
+
+    Linear phase means a fixed group delay of (num_taps - 1) / 2 samples,
+    which cancels identically between wav_hat and wav_true inside an L1
+    comparison — so the filter is transparent to the loss value.
+    """
+    nyquist = sample_rate / 2
+    cutoff_norm = cutoff_hz / nyquist
+
+    t = torch.arange(num_taps, dtype=torch.float32) - (num_taps - 1) / 2
+    pi_t = torch.pi * t
+    sinc = torch.where(
+        t == 0,
+        torch.tensor(cutoff_norm),
+        torch.sin(cutoff_norm * pi_t) / pi_t.clamp(min=1e-12),
+    )
+    kernel = sinc * torch.hann_window(num_taps)
+    return kernel / kernel.sum()
+
+
+class LowpassL1Loss(nn.Module):
+    """L1 on a linear-phase-lowpassed version of both waveforms.
+
+    Targets sub-cutoff frequency content (kick body, snare fundamentals)
+    as a direct sample-space objective, without inheriting the
+    phase-sensitivity of full-band waveform L1 — low-frequency content
+    is smooth over many samples, so small transient phase drift doesn't
+    produce large error.
+    """
+
+    def __init__(self, cutoff_hz: float = 500.0, sample_rate: int = 44100, num_taps: int = 257):
+        super().__init__()
+        kernel = _make_lowpass_fir(cutoff_hz, sample_rate, num_taps)
+        self.register_buffer("kernel", kernel.view(1, 1, -1))
+        self.pad = (num_taps - 1) // 2
+
+    def forward(self, wav_hat: torch.Tensor, wav_true: torch.Tensor) -> torch.Tensor:
+        # wav_* shape: (B, T) — add channel dim, reflect-pad, conv, compare.
+        wh = F.pad(wav_hat.unsqueeze(1), (self.pad, self.pad), mode="reflect")
+        wt = F.pad(wav_true.unsqueeze(1), (self.pad, self.pad), mode="reflect")
+        wh_lp = F.conv1d(wh, self.kernel)
+        wt_lp = F.conv1d(wt, self.kernel)
+        return F.l1_loss(wh_lp, wt_lp)
+
+
 def _build_stft_losses():
-    """Build (linear_mrstft, mel_mrstft) pair based on CFG weights.
+    """Build (linear_mrstft, mel_mrstft, lowpass_l1) triple based on CFG.
 
     FFT sizes tuned for drums at 44.1 kHz: 4096 resolves sub-bass (~10.7 Hz
     bin — kick fundamentals at 50–80 Hz land in bins 5–8 with clear
@@ -101,13 +235,17 @@ def _build_stft_losses():
     transients (~11 ms window).
 
     - linear MRSTFT: magnitude + phase term (w_phs = CFG.vae_stft_phase_weight).
-      The phase term directly penalizes phase-incoherence artifacts (ringing,
-      tonal smearing in high frequencies) that magnitude-only loss misses.
+      When CFG.vae_stft_weighted is True, uses WeightedMRSTFTLoss with the
+      drum_weight_curve instead of auraloss — same FFT sizes, but per-bin
+      frequency weighting that boosts the kick band and masks DC / noise
+      floor. Phase term is not available on the weighted path.
     - mel MRSTFT: mel-scaled magnitude loss that compresses narrow
       high-frequency spikes into perceptually wider bins, reducing the
       optimizer's incentive to "pay off" magnitude targets with ringy tones.
+    - lowpass L1: linear-phase FIR lowpass of both waveforms, then L1.
+      Direct sample-space target on sub-cutoff content (kick body).
 
-    Either component may be None if its weight is 0.
+    Any component may be None if its weight is 0.
     """
     from auraloss.freq import MultiResolutionSTFTLoss
 
@@ -117,15 +255,24 @@ def _build_stft_losses():
 
     linear = None
     if CFG.vae_stft_weight > 0:
-        linear = MultiResolutionSTFTLoss(
-            fft_sizes=fft,
-            hop_sizes=hop,
-            win_lengths=win,
-            w_sc=1.0,
-            w_log_mag=1.0,
-            w_lin_mag=0.0,
-            w_phs=CFG.vae_stft_phase_weight,
-        ).to(DEVICE)
+        if CFG.vae_stft_weighted:
+            linear = WeightedMRSTFTLoss(
+                fft_sizes=fft,
+                hop_sizes=hop,
+                win_lengths=win,
+                sample_rate=CFG.sample_rate,
+                weight_fn=drum_weight_curve,
+            ).to(DEVICE)
+        else:
+            linear = MultiResolutionSTFTLoss(
+                fft_sizes=fft,
+                hop_sizes=hop,
+                win_lengths=win,
+                w_sc=1.0,
+                w_log_mag=1.0,
+                w_lin_mag=0.0,
+                w_phs=CFG.vae_stft_phase_weight,
+            ).to(DEVICE)
 
     mel = None
     if CFG.vae_stft_mel_weight > 0:
@@ -144,7 +291,14 @@ def _build_stft_losses():
             n_bins=64,
         ).to(DEVICE)
 
-    return linear, mel
+    lowpass = None
+    if CFG.vae_lowpass_weight > 0:
+        lowpass = LowpassL1Loss(
+            cutoff_hz=CFG.vae_lowpass_cutoff,
+            sample_rate=CFG.sample_rate,
+        ).to(DEVICE)
+
+    return linear, mel, lowpass
 
 
 def train_vae(train_loader, val_loader, resume_state: dict | None = None):
@@ -165,25 +319,34 @@ def train_vae(train_loader, val_loader, resume_state: dict | None = None):
             f"(best_val={best_val:.5f}), continuing at epoch {start_epoch}"
         )
 
-    stft_linear, stft_mel = _build_stft_losses()
-    stft_enabled = stft_linear is not None or stft_mel is not None
-    if stft_enabled:
+    stft_linear, stft_mel, lowpass = _build_stft_losses()
+    waveform_losses_enabled = (
+        stft_linear is not None or stft_mel is not None or lowpass is not None
+    )
+    if waveform_losses_enabled:
         parts = []
         if stft_linear is not None:
-            part = f"linear(w={CFG.vae_stft_weight}"
-            if CFG.vae_stft_phase_weight > 0:
+            kind = "linear-weighted" if CFG.vae_stft_weighted else "linear"
+            part = f"{kind}(w={CFG.vae_stft_weight}"
+            if not CFG.vae_stft_weighted and CFG.vae_stft_phase_weight > 0:
                 part += f", w_phs={CFG.vae_stft_phase_weight}"
             part += ")"
             parts.append(part)
         if stft_mel is not None:
             parts.append(f"mel(w={CFG.vae_stft_mel_weight})")
-        print(f"[vae] STFT losses enabled: {' + '.join(parts)}")
+        if lowpass is not None:
+            parts.append(
+                f"lowpass-L1(w={CFG.vae_lowpass_weight}, "
+                f"cutoff={CFG.vae_lowpass_cutoff:.0f}Hz)"
+            )
+        print(f"[vae] waveform-space losses enabled: {' + '.join(parts)}")
 
     def apply_stft(loss, dac_z, recon_z, wav_true_pre, no_grad_recon: bool):
-        """Adds the STFT loss terms (linear + mel, as configured) to `loss`.
+        """Adds waveform-space losses (linear STFT + mel STFT + lowpass L1,
+        as configured) to `loss`.
 
         If `wav_true_pre` is a non-empty tensor (shape (B, T) > 0 samples),
-        it's used directly as the STFT loss target and the target-path DAC
+        it's used directly as the target waveform and the target-path DAC
         decode is skipped — the pre-decoded path, ~40% faster per step.
         Otherwise the target waveform is produced live via DAC decode.
 
@@ -191,7 +354,7 @@ def train_vae(train_loader, val_loader, resume_state: dict | None = None):
         gradient tracking (used during validation). Otherwise gradients
         flow through DAC back into the VAE (used during training).
         """
-        if not stft_enabled:
+        if not waveform_losses_enabled:
             return loss
         if wav_true_pre is not None and wav_true_pre.numel() > 0:
             wav_true = wav_true_pre
@@ -204,6 +367,8 @@ def train_vae(train_loader, val_loader, resume_state: dict | None = None):
             loss = loss + CFG.vae_stft_weight * stft_linear(wh, wt)
         if stft_mel is not None:
             loss = loss + CFG.vae_stft_mel_weight * stft_mel(wh, wt)
+        if lowpass is not None:
+            loss = loss + CFG.vae_lowpass_weight * lowpass(wav_hat, wav_true)
         return loss
 
     for epoch in range(start_epoch, CFG.vae_epochs + 1):
@@ -513,6 +678,41 @@ def main():
              f"Default: CFG.vae_stft_mel_weight ({CFG.vae_stft_mel_weight}).",
     )
     parser.add_argument(
+        "--vae-stft-weighted",
+        action="store_true",
+        help="Use a per-frequency-bin weighted linear MRSTFT (drum weight "
+             "curve: 0x below 20 Hz, 3x in 40-320 Hz kick band, 1x mids, "
+             "rolloff above 15 kHz) in place of auraloss's uniform-weight "
+             "linear MRSTFT. Targets the specific failure mode where linear "
+             "STFT spends most of its ~2048 bins on high frequencies and "
+             "under-weights the ~10 bins where kick fundamentals live. The "
+             "outer --vae-stft-weight coefficient still applies on top. "
+             "Phase term is not available on the weighted path. Off by "
+             "default.",
+    )
+    parser.add_argument(
+        "--vae-lowpass-weight",
+        type=float,
+        default=None,
+        help=f"Weight for an L1 loss on linear-phase-lowpassed waveforms. "
+             f"Direct sample-space target on sub-cutoff content (kick body, "
+             f"snare fundamentals) — picks up where STFT losses are "
+             f"proportionally weakest. Waveform L1 at low frequencies is "
+             f"robust to small transient phase drift because low-frequency "
+             f"content is smooth over many samples. 0 disables. Typical "
+             f"values 0.1-0.3. "
+             f"Default: CFG.vae_lowpass_weight ({CFG.vae_lowpass_weight}).",
+    )
+    parser.add_argument(
+        "--vae-lowpass-cutoff",
+        type=float,
+        default=None,
+        help=f"Cutoff frequency in Hz for --vae-lowpass-weight. 500 Hz "
+             f"captures kick fundamentals (50-100 Hz), first harmonics, "
+             f"and snare body. Higher values include tom fundamentals. "
+             f"Default: CFG.vae_lowpass_cutoff ({CFG.vae_lowpass_cutoff}).",
+    )
+    parser.add_argument(
         "--cudnn-benchmark",
         choices=["auto", "on", "off"],
         default="auto",
@@ -600,6 +800,18 @@ def main():
     if args.vae_stft_mel_weight is not None:
         CFG.vae_stft_mel_weight = args.vae_stft_mel_weight
         print(f"[train] vae_stft_mel_weight: {args.vae_stft_mel_weight}")
+
+    if args.vae_stft_weighted:
+        CFG.vae_stft_weighted = True
+        print("[train] vae_stft_weighted: True (drum weight curve)")
+
+    if args.vae_lowpass_weight is not None:
+        CFG.vae_lowpass_weight = args.vae_lowpass_weight
+        print(f"[train] vae_lowpass_weight: {args.vae_lowpass_weight}")
+
+    if args.vae_lowpass_cutoff is not None:
+        CFG.vae_lowpass_cutoff = args.vae_lowpass_cutoff
+        print(f"[train] vae_lowpass_cutoff: {args.vae_lowpass_cutoff}")
 
     # DAC inference optimizations. Weight-norm fusion always on (configured
     # inside codec.py at DAC load time). bf16 autocast and torch.compile are
