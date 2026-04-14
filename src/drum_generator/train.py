@@ -30,23 +30,57 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ---------------------------------------------------------------------------
 
 
-def _build_stft_loss():
-    """Multi-resolution STFT loss for perceptual waveform-space reconstruction.
+def _build_stft_losses():
+    """Build (linear_mrstft, mel_mrstft) pair based on CFG weights.
 
     FFT sizes tuned for drums at 44.1 kHz: 2048 catches low-frequency body
     (down to ~22 Hz bin), 1024 mid detail, 512 catches transients (~11 ms).
-    No mel scaling, no perceptual weighting — we want to preserve drum body,
-    not de-emphasize it.
+
+    - linear MRSTFT: magnitude + phase term (w_phs = CFG.vae_stft_phase_weight).
+      The phase term directly penalizes phase-incoherence artifacts (ringing,
+      tonal smearing in high frequencies) that magnitude-only loss misses.
+    - mel MRSTFT: mel-scaled magnitude loss that compresses narrow
+      high-frequency spikes into perceptually wider bins, reducing the
+      optimizer's incentive to "pay off" magnitude targets with ringy tones.
+
+    Either component may be None if its weight is 0.
     """
     from auraloss.freq import MultiResolutionSTFTLoss
-    return MultiResolutionSTFTLoss(
-        fft_sizes=[2048, 1024, 512],
-        hop_sizes=[512, 256, 128],
-        win_lengths=[2048, 1024, 512],
-        w_sc=1.0,
-        w_log_mag=1.0,
-        w_lin_mag=0.0,
-    ).to(DEVICE)
+
+    fft = [2048, 1024, 512]
+    hop = [512, 256, 128]
+    win = [2048, 1024, 512]
+
+    linear = None
+    if CFG.vae_stft_weight > 0:
+        linear = MultiResolutionSTFTLoss(
+            fft_sizes=fft,
+            hop_sizes=hop,
+            win_lengths=win,
+            w_sc=1.0,
+            w_log_mag=1.0,
+            w_lin_mag=0.0,
+            w_phs=CFG.vae_stft_phase_weight,
+        ).to(DEVICE)
+
+    mel = None
+    if CFG.vae_stft_mel_weight > 0:
+        # n_bins=64 — at fft_size=512 (smallest resolution), 128 mel bins
+        # produces empty filters at the low end (too narrow vs FFT bin width)
+        # and yields NaN. 64 bins is safe across [2048, 1024, 512].
+        mel = MultiResolutionSTFTLoss(
+            fft_sizes=fft,
+            hop_sizes=hop,
+            win_lengths=win,
+            w_sc=1.0,
+            w_log_mag=1.0,
+            w_lin_mag=0.0,
+            scale="mel",
+            sample_rate=CFG.sample_rate,
+            n_bins=64,
+        ).to(DEVICE)
+
+    return linear, mel
 
 
 def train_vae(train_loader, val_loader):
@@ -54,10 +88,38 @@ def train_vae(train_loader, val_loader):
     opt = torch.optim.AdamW(vae.parameters(), lr=CFG.lr)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, CFG.vae_epochs)
 
-    stft_loss_fn = None
-    if CFG.vae_stft_weight and CFG.vae_stft_weight > 0:
-        stft_loss_fn = _build_stft_loss()
-        print(f"[vae] multi-res STFT loss enabled (weight={CFG.vae_stft_weight})")
+    stft_linear, stft_mel = _build_stft_losses()
+    stft_enabled = stft_linear is not None or stft_mel is not None
+    if stft_enabled:
+        parts = []
+        if stft_linear is not None:
+            part = f"linear(w={CFG.vae_stft_weight}"
+            if CFG.vae_stft_phase_weight > 0:
+                part += f", w_phs={CFG.vae_stft_phase_weight}"
+            part += ")"
+            parts.append(part)
+        if stft_mel is not None:
+            parts.append(f"mel(w={CFG.vae_stft_mel_weight})")
+        print(f"[vae] STFT losses enabled: {' + '.join(parts)}")
+
+    def apply_stft(loss, dac_z, recon_z, no_grad_recon: bool):
+        """Adds the STFT loss terms (linear + mel, as configured) to `loss`.
+
+        When `no_grad_recon` is True, the recon-path DAC decode skips
+        gradient tracking (used during validation). Otherwise gradients
+        flow through DAC back into the VAE (used during training).
+        """
+        if not stft_enabled:
+            return loss
+        wav_true = decode_from_dac_latent(dac_z, DEVICE, no_grad=True)
+        wav_hat = decode_from_dac_latent(recon_z, DEVICE, no_grad=no_grad_recon)
+        wh = wav_hat.unsqueeze(1)
+        wt = wav_true.unsqueeze(1)
+        if stft_linear is not None:
+            loss = loss + CFG.vae_stft_weight * stft_linear(wh, wt)
+        if stft_mel is not None:
+            loss = loss + CFG.vae_stft_mel_weight * stft_mel(wh, wt)
+        return loss
 
     best_val = float("inf")
     for epoch in range(1, CFG.vae_epochs + 1):
@@ -75,14 +137,7 @@ def train_vae(train_loader, val_loader):
             kl_w = min(CFG.vae_kl_weight, CFG.vae_kl_weight * epoch / CFG.vae_kl_warmup)
             loss, recon, kl = vae_loss(recon_z, dac_z, mu, logvar, kl_w)
 
-            if stft_loss_fn is not None:
-                # Compare waveforms post-DAC-decode. Target decode runs under
-                # no_grad to save memory; prediction decode keeps gradients so
-                # the STFT loss can backprop through DAC → VAE.
-                wav_true = decode_from_dac_latent(dac_z, DEVICE, no_grad=True)
-                wav_hat = decode_from_dac_latent(recon_z, DEVICE, no_grad=False)
-                stft_loss = stft_loss_fn(wav_hat.unsqueeze(1), wav_true.unsqueeze(1))
-                loss = loss + CFG.vae_stft_weight * stft_loss
+            loss = apply_stft(loss, dac_z, recon_z, no_grad_recon=False)
 
             opt.zero_grad()
             loss.backward()
@@ -101,11 +156,7 @@ def train_vae(train_loader, val_loader):
                 dac_z = audio if audio.dim() == 3 else encode_to_dac_latent(audio, DEVICE)
                 recon_z, mu, logvar, _ = vae(dac_z)
                 loss, _, _ = vae_loss(recon_z, dac_z, mu, logvar, CFG.vae_kl_weight)
-                if stft_loss_fn is not None:
-                    wav_true = decode_from_dac_latent(dac_z, DEVICE, no_grad=True)
-                    wav_hat = decode_from_dac_latent(recon_z, DEVICE, no_grad=True)
-                    stft_loss = stft_loss_fn(wav_hat.unsqueeze(1), wav_true.unsqueeze(1))
-                    loss = loss + CFG.vae_stft_weight * stft_loss
+                loss = apply_stft(loss, dac_z, recon_z, no_grad_recon=True)
                 val_loss += loss.item()
 
         train_loss /= len(train_loader)
@@ -299,10 +350,32 @@ def main():
         "--vae-stft-weight",
         type=float,
         default=None,
-        help=f"Weight for auraloss multi-res STFT loss (applied in waveform "
-             f"space via DAC decode). 0 disables; typical values 0.1–1.0. "
-             f"Roughly doubles per-step training cost when enabled. "
+        help=f"Weight for linear multi-res STFT magnitude loss (applied in "
+             f"waveform space via DAC decode). 0 disables the linear STFT "
+             f"term; typical values 0.5–4.0. Roughly doubles per-step training "
+             f"cost when any STFT term is enabled. "
              f"Default: CFG.vae_stft_weight ({CFG.vae_stft_weight}).",
+    )
+    parser.add_argument(
+        "--vae-stft-phase-weight",
+        type=float,
+        default=None,
+        help=f"Phase term (w_phs) inside the linear MRSTFT constructor — "
+             f"targets phase-incoherence artifacts (ringing, tonal smearing) "
+             f"that magnitude-only STFT loss misses. 0 disables. Typical "
+             f"values 0.1–0.5; higher can destabilize training. "
+             f"Default: CFG.vae_stft_phase_weight ({CFG.vae_stft_phase_weight}).",
+    )
+    parser.add_argument(
+        "--vae-stft-mel-weight",
+        type=float,
+        default=None,
+        help=f"Weight for a separate mel-scaled multi-res STFT loss, added "
+             f"on top of the linear STFT term. Mel compresses narrow "
+             f"high-frequency spikes into perceptually wider bins, reducing "
+             f"the optimizer's incentive to produce ringy tones to match "
+             f"magnitude targets. 0 disables. Typical values 0.5–2.0. "
+             f"Default: CFG.vae_stft_mel_weight ({CFG.vae_stft_mel_weight}).",
     )
     parser.add_argument(
         "--cudnn-benchmark",
@@ -359,6 +432,14 @@ def main():
         CFG.vae_stft_weight = args.vae_stft_weight
         print(f"[train] vae_stft_weight: {args.vae_stft_weight}")
 
+    if args.vae_stft_phase_weight is not None:
+        CFG.vae_stft_phase_weight = args.vae_stft_phase_weight
+        print(f"[train] vae_stft_phase_weight: {args.vae_stft_phase_weight}")
+
+    if args.vae_stft_mel_weight is not None:
+        CFG.vae_stft_mel_weight = args.vae_stft_mel_weight
+        print(f"[train] vae_stft_mel_weight: {args.vae_stft_mel_weight}")
+
     # cuDNN benchmark mode. 'auto' = off when STFT loss is enabled (DAC decoder
     # has many conv shapes and optimal GB10 kernels often aren't available, so
     # benchmarking is wasted work and stalls first-step). 'on' | 'off' override.
@@ -369,7 +450,10 @@ def main():
         torch.backends.cudnn.benchmark = False
         print("[train] cudnn.benchmark: off")
     else:  # auto
-        auto_off = bool(CFG.vae_stft_weight and CFG.vae_stft_weight > 0)
+        auto_off = (
+            (CFG.vae_stft_weight and CFG.vae_stft_weight > 0)
+            or (CFG.vae_stft_mel_weight and CFG.vae_stft_mel_weight > 0)
+        )
         torch.backends.cudnn.benchmark = not auto_off
         print(f"[train] cudnn.benchmark: auto -> {'off' if auto_off else 'on'}")
 
