@@ -45,6 +45,7 @@ class Config:
     vae_lowpass_weight: float = 0.0  # L1 on lowpassed waveform, targets sub-cutoff content (0 disables)
     vae_lowpass_cutoff: float = 500.0  # lowpass cutoff in Hz for the L1 term
     dit_epochs: int = 500
+    dit_eta_min: float = 0.0  # CosineAnnealingLR floor (0 = schedule ends at 0 LR)
     cfg_dropout: float = 0.1  # prob of dropping text cond (CFG training)
     cfg_scale: float = 4.0  # guidance scale at inference
     ref_dropout: float = 0.5  # prob of dropping audio reference (high → text-only works well)

@@ -469,7 +469,9 @@ def _derangement(n: int, device: str = "cpu") -> torch.Tensor:
 def train_dit(train_loader, val_loader, vae: DrumVAE, resume_state: dict | None = None):
     dit = DrumDiT().to(DEVICE)
     opt = torch.optim.AdamW(dit.parameters(), lr=CFG.lr, weight_decay=1e-4)
-    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, CFG.dit_epochs)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, CFG.dit_epochs, eta_min=CFG.dit_eta_min
+    )
 
     vae.eval()
     start_epoch = 1
@@ -640,6 +642,17 @@ def main():
              f"Default: CFG.dit_epochs ({CFG.dit_epochs}).",
     )
     parser.add_argument(
+        "--dit-eta-min",
+        type=float,
+        default=None,
+        help=f"CosineAnnealingLR floor for DiT training. Same purpose as "
+             f"--vae-eta-min: the default (0) decays LR all the way to 0 at "
+             f"the last epoch, leaving tail refinement on the table. A small "
+             f"nonzero value (e.g. 1e-6, 1%% of the default --lr=1e-4) keeps "
+             f"the tail productive. Safe range: 0 to --lr/10. "
+             f"Default: CFG.dit_eta_min ({CFG.dit_eta_min}).",
+    )
+    parser.add_argument(
         "--vae-kl-weight",
         type=float,
         default=None,
@@ -794,6 +807,10 @@ def main():
     if args.vae_eta_min is not None:
         CFG.vae_eta_min = args.vae_eta_min
         print(f"[train] vae_eta_min: {args.vae_eta_min}")
+
+    if args.dit_eta_min is not None:
+        CFG.dit_eta_min = args.dit_eta_min
+        print(f"[train] dit_eta_min: {args.dit_eta_min}")
 
     if args.dit_epochs is not None:
         CFG.dit_epochs = args.dit_epochs
