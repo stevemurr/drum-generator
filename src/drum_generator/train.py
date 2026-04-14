@@ -304,7 +304,9 @@ def _build_stft_losses():
 def train_vae(train_loader, val_loader, resume_state: dict | None = None):
     vae = DrumVAE().to(DEVICE)
     opt = torch.optim.AdamW(vae.parameters(), lr=CFG.lr)
-    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, CFG.vae_epochs)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, CFG.vae_epochs, eta_min=CFG.vae_eta_min
+    )
 
     start_epoch = 1
     best_val = float("inf")
@@ -611,6 +613,17 @@ def main():
              f"Default: CFG.vae_epochs ({CFG.vae_epochs}).",
     )
     parser.add_argument(
+        "--vae-eta-min",
+        type=float,
+        default=None,
+        help=f"CosineAnnealingLR floor for VAE training. The default (0) "
+             f"means the LR decays all the way to 0 at the last epoch, so "
+             f"late epochs stop learning. A small nonzero value (e.g. 1e-6, "
+             f"which is 1%% of the default --lr=1e-4) keeps the tail "
+             f"productive. Safe range: 0 to --lr/10. "
+             f"Default: CFG.vae_eta_min ({CFG.vae_eta_min}).",
+    )
+    parser.add_argument(
         "--dit-epochs",
         type=int,
         default=None,
@@ -768,6 +781,10 @@ def main():
     if args.vae_epochs is not None:
         CFG.vae_epochs = args.vae_epochs
         print(f"[train] vae_epochs: {args.vae_epochs}")
+
+    if args.vae_eta_min is not None:
+        CFG.vae_eta_min = args.vae_eta_min
+        print(f"[train] vae_eta_min: {args.vae_eta_min}")
 
     if args.dit_epochs is not None:
         CFG.dit_epochs = args.dit_epochs

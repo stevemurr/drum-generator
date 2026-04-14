@@ -35,6 +35,7 @@ class Config:
     batch_size: int = 16
     lr: float = 1e-4
     vae_epochs: int = 100
+    vae_eta_min: float = 0.0  # CosineAnnealingLR floor (0 = schedule ends at 0 LR)
     vae_kl_weight: float = 1e-2  # KL regularization strength (higher = smoother latent space)
     vae_kl_warmup: int = 20  # epochs to ramp KL weight from 0 → vae_kl_weight
     vae_stft_weight: float = 0.0  # linear multi-res STFT loss weight (0 disables)
