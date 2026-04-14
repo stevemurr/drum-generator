@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 
-from drum_generator.codec import decode_from_dac_latent, encode_to_dac_latent
+from drum_generator.codec import decode_from_dac_latent, encode_to_dac_latent, set_dac_optim
 from drum_generator.config import CFG
 from drum_generator.dataset import build_dataset
 from drum_generator.dit import DrumDiT, flow_matching_loss
@@ -390,6 +390,23 @@ def main():
              "(DAC decoder has many shapes and GB10 benchmark payoff is low), "
              "otherwise on. Default: auto.",
     )
+    parser.add_argument(
+        "--dac-bf16",
+        action="store_true",
+        help="Run DAC forward passes under torch.autocast bf16. Cuts DAC "
+             "decode memory ~2x and speeds it up ~1.3-1.8x on GB10. Safe for "
+             "gradient flow through DAC (bf16 has fp32 dynamic range). "
+             "Off by default.",
+    )
+    parser.add_argument(
+        "--dac-compile",
+        action="store_true",
+        help="Wrap DAC's decode method with torch.compile(mode='reduce-overhead'). "
+             "Can give 1.5-2x speedup on the decode forward/backward. Adds "
+             "~30-90s to first-decode latency (compile warmup). GB10 SM_121 "
+             "support in TorchInductor is variable — if it errors, disable. "
+             "Off by default.",
+    )
     args = parser.parse_args()
 
     if args.memmap_dir:
@@ -439,6 +456,13 @@ def main():
     if args.vae_stft_mel_weight is not None:
         CFG.vae_stft_mel_weight = args.vae_stft_mel_weight
         print(f"[train] vae_stft_mel_weight: {args.vae_stft_mel_weight}")
+
+    # DAC inference optimizations. Weight-norm fusion always on (configured
+    # inside codec.py at DAC load time). bf16 autocast and torch.compile are
+    # opt-in because they have higher risk profiles on GB10.
+    if args.dac_bf16 or args.dac_compile:
+        set_dac_optim(bf16=args.dac_bf16, compile=args.dac_compile)
+        print(f"[train] dac optim: bf16={args.dac_bf16}  compile={args.dac_compile}")
 
     # cuDNN benchmark mode. 'auto' = off when STFT loss is enabled (DAC decoder
     # has many conv shapes and optimal GB10 kernels often aren't available, so
