@@ -95,8 +95,10 @@ def _unpack_batch(batch, device):
 def _build_stft_losses():
     """Build (linear_mrstft, mel_mrstft) pair based on CFG weights.
 
-    FFT sizes tuned for drums at 44.1 kHz: 2048 catches low-frequency body
-    (down to ~22 Hz bin), 1024 mid detail, 512 catches transients (~11 ms).
+    FFT sizes tuned for drums at 44.1 kHz: 4096 resolves sub-bass (~10.7 Hz
+    bin — kick fundamentals at 50–80 Hz land in bins 5–8 with clear
+    separation), 2048 low-body (~21 Hz bin), 1024 mid detail, 512 catches
+    transients (~11 ms window).
 
     - linear MRSTFT: magnitude + phase term (w_phs = CFG.vae_stft_phase_weight).
       The phase term directly penalizes phase-incoherence artifacts (ringing,
@@ -109,9 +111,9 @@ def _build_stft_losses():
     """
     from auraloss.freq import MultiResolutionSTFTLoss
 
-    fft = [2048, 1024, 512]
-    hop = [512, 256, 128]
-    win = [2048, 1024, 512]
+    fft = [4096, 2048, 1024, 512]
+    hop = [1024, 512, 256, 128]
+    win = [4096, 2048, 1024, 512]
 
     linear = None
     if CFG.vae_stft_weight > 0:
