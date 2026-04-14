@@ -11,8 +11,10 @@ Run:
 
 import argparse
 import os
+import random
 import time
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
@@ -24,6 +26,68 @@ from drum_generator.dit import DrumDiT, flow_matching_loss
 from drum_generator.vae import DrumVAE, vae_loss
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ---------------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------------
+
+
+def _capture_rng() -> dict:
+    """Snapshot main-process RNG state (torch/cuda/numpy/python).
+
+    Worker-process RNGs are intentionally not captured — bit-exact resume
+    isn't a goal, just "approximately continue training".
+    """
+    return {
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "numpy": np.random.get_state(),
+        "python": random.getstate(),
+    }
+
+
+def _restore_rng(state: dict) -> None:
+    torch.set_rng_state(state["torch"])
+    if state.get("cuda") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+    np.random.set_state(state["numpy"])
+    random.setstate(state["python"])
+
+
+def _save_ckpt(
+    path: str,
+    *,
+    phase: str,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    epoch: int,
+    best_val: float,
+) -> None:
+    """Atomic dict-format checkpoint write: tmp file + rename."""
+    ckpt = {
+        "phase": phase,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "epoch": epoch,
+        "best_val": best_val,
+        "rng": _capture_rng(),
+    }
+    tmp = path + ".tmp"
+    torch.save(ckpt, tmp)
+    os.replace(tmp, path)
+
+
+def _unwrap_model_state(ckpt) -> dict:
+    """Return a flat model state_dict from either format.
+
+    New format: dict with a "model" key. Legacy format: flat state_dict.
+    """
+    if isinstance(ckpt, dict) and "model" in ckpt and "phase" in ckpt:
+        return ckpt["model"]
+    return ckpt
 
 
 # ---------------------------------------------------------------------------
@@ -101,10 +165,24 @@ def _build_stft_losses():
     return linear, mel
 
 
-def train_vae(train_loader, val_loader):
+def train_vae(train_loader, val_loader, resume_state: dict | None = None):
     vae = DrumVAE().to(DEVICE)
     opt = torch.optim.AdamW(vae.parameters(), lr=CFG.lr)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, CFG.vae_epochs)
+
+    start_epoch = 1
+    best_val = float("inf")
+    if resume_state is not None:
+        vae.load_state_dict(resume_state["model"])
+        opt.load_state_dict(resume_state["optimizer"])
+        sch.load_state_dict(resume_state["scheduler"])
+        start_epoch = resume_state["epoch"] + 1
+        best_val = resume_state["best_val"]
+        _restore_rng(resume_state["rng"])
+        print(
+            f"[vae] resumed from epoch {resume_state['epoch']} "
+            f"(best_val={best_val:.5f}), continuing at epoch {start_epoch}"
+        )
 
     stft_linear, stft_mel = _build_stft_losses()
     stft_enabled = stft_linear is not None or stft_mel is not None
@@ -147,8 +225,7 @@ def train_vae(train_loader, val_loader):
             loss = loss + CFG.vae_stft_mel_weight * stft_mel(wh, wt)
         return loss
 
-    best_val = float("inf")
-    for epoch in range(1, CFG.vae_epochs + 1):
+    for epoch in range(start_epoch, CFG.vae_epochs + 1):
         epoch_start = time.time()
         # --- train ---
         vae.train()
@@ -195,9 +272,27 @@ def train_vae(train_loader, val_loader):
             f"time {epoch_time:.1f}s"
         )
 
+        _save_ckpt(
+            f"{CFG.ckpt_dir}/vae_last.pt",
+            phase="vae",
+            model=vae,
+            optimizer=opt,
+            scheduler=sch,
+            epoch=epoch,
+            best_val=best_val,
+        )
+
         if val_loss < best_val:
             best_val = val_loss
-            torch.save(vae.state_dict(), f"{CFG.ckpt_dir}/vae_best.pt")
+            _save_ckpt(
+                f"{CFG.ckpt_dir}/vae_best.pt",
+                phase="vae",
+                model=vae,
+                optimizer=opt,
+                scheduler=sch,
+                epoch=epoch,
+                best_val=best_val,
+            )
             print(f"  ✓ saved vae_best.pt")
 
     return vae
@@ -223,15 +318,27 @@ def _derangement(n: int, device: str = "cpu") -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def train_dit(train_loader, val_loader, vae: DrumVAE):
+def train_dit(train_loader, val_loader, vae: DrumVAE, resume_state: dict | None = None):
     dit = DrumDiT().to(DEVICE)
     opt = torch.optim.AdamW(dit.parameters(), lr=CFG.lr, weight_decay=1e-4)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, CFG.dit_epochs)
 
     vae.eval()
+    start_epoch = 1
     best_val = float("inf")
+    if resume_state is not None:
+        dit.load_state_dict(resume_state["model"])
+        opt.load_state_dict(resume_state["optimizer"])
+        sch.load_state_dict(resume_state["scheduler"])
+        start_epoch = resume_state["epoch"] + 1
+        best_val = resume_state["best_val"]
+        _restore_rng(resume_state["rng"])
+        print(
+            f"[dit] resumed from epoch {resume_state['epoch']} "
+            f"(best_val={best_val:.5f}), continuing at epoch {start_epoch}"
+        )
 
-    for epoch in range(1, CFG.dit_epochs + 1):
+    for epoch in range(start_epoch, CFG.dit_epochs + 1):
         epoch_start = time.time()
         # --- train ---
         dit.train()
@@ -296,9 +403,27 @@ def train_dit(train_loader, val_loader, vae: DrumVAE):
             f"time {epoch_time:.1f}s"
         )
 
+        _save_ckpt(
+            f"{CFG.ckpt_dir}/dit_last.pt",
+            phase="dit",
+            model=dit,
+            optimizer=opt,
+            scheduler=sch,
+            epoch=epoch,
+            best_val=best_val,
+        )
+
         if val_loss < best_val:
             best_val = val_loss
-            torch.save(dit.state_dict(), f"{CFG.ckpt_dir}/dit_best.pt")
+            _save_ckpt(
+                f"{CFG.ckpt_dir}/dit_best.pt",
+                phase="dit",
+                model=dit,
+                optimizer=opt,
+                scheduler=sch,
+                epoch=epoch,
+                best_val=best_val,
+            )
             print(f"  ✓ saved dit_best.pt")
 
     return dit
@@ -429,6 +554,15 @@ def main():
              "Off by default.",
     )
     parser.add_argument(
+        "--resume-ckpt",
+        default=None,
+        help="Path to a checkpoint (vae_last.pt / vae_best.pt / dit_last.pt / "
+             "dit_best.pt) to resume training from. Restores model, optimizer, "
+             "scheduler, epoch counter, best_val, and main-process RNG. The "
+             "checkpoint's phase must match --phase, and its scheduler T_max "
+             "must match the current --{phase}-epochs value.",
+    )
+    parser.add_argument(
         "--dac-compile",
         action="store_true",
         help="Wrap DAC's decode method with torch.compile(mode='reduce-overhead'). "
@@ -531,17 +665,55 @@ def main():
         val_ds, batch_size=CFG.batch_size, shuffle=False, num_workers=4, pin_memory=True
     )
 
+    # Load resume checkpoint once (if any). It applies to whichever phase's
+    # loop starts first; subsequent phases in a --phase both run start fresh.
+    resume_vae = None
+    resume_dit = None
+    if args.resume_ckpt is not None:
+        ckpt = torch.load(args.resume_ckpt, map_location=DEVICE)
+        if not (isinstance(ckpt, dict) and "phase" in ckpt):
+            raise ValueError(
+                f"--resume-ckpt {args.resume_ckpt}: not a resumable "
+                f"checkpoint (missing 'phase' field; likely a legacy "
+                f"state-dict-only file)"
+            )
+        ckpt_phase = ckpt["phase"]
+        if args.phase not in (ckpt_phase, "both"):
+            raise ValueError(
+                f"--resume-ckpt phase mismatch: checkpoint is '{ckpt_phase}' "
+                f"but --phase is '{args.phase}'"
+            )
+        expected_T = CFG.vae_epochs if ckpt_phase == "vae" else CFG.dit_epochs
+        sched_T = ckpt["scheduler"].get("T_max")
+        if sched_T != expected_T:
+            raise ValueError(
+                f"--resume-ckpt scheduler T_max mismatch: checkpoint has "
+                f"T_max={sched_T} but current --{ckpt_phase}-epochs is "
+                f"{expected_T}. Rerun with --{ckpt_phase}-epochs {sched_T} "
+                f"to resume, or start a fresh run."
+            )
+        if ckpt_phase == "vae":
+            resume_vae = ckpt
+        else:
+            resume_dit = ckpt
+        print(
+            f"[train] resume: {args.resume_ckpt} "
+            f"(phase={ckpt_phase}, epoch={ckpt['epoch']})"
+        )
+
     if args.phase in ("vae", "both"):
         print("\n=== Phase 1: VAE training ===")
-        vae = train_vae(train_loader, val_loader)
+        vae = train_vae(train_loader, val_loader, resume_state=resume_vae)
 
     if args.phase in ("dit", "both"):
         print("\n=== Phase 2: DiT training ===")
         vae = DrumVAE().to(DEVICE)
         vae.load_state_dict(
-            torch.load(f"{CFG.ckpt_dir}/vae_best.pt", map_location=DEVICE)
+            _unwrap_model_state(
+                torch.load(f"{CFG.ckpt_dir}/vae_best.pt", map_location=DEVICE)
+            )
         )
-        train_dit(train_loader, val_loader, vae)
+        train_dit(train_loader, val_loader, vae, resume_state=resume_dit)
 
 
 if __name__ == "__main__":

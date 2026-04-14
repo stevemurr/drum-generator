@@ -24,14 +24,26 @@ from drum_generator.vae import DrumVAE
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _load_state_dict(path: str) -> dict:
+    """Load a checkpoint and return its model state_dict.
+
+    Accepts both new dict-format resumable checkpoints (with "phase"/"model"
+    keys) and legacy flat state_dict files.
+    """
+    ckpt = torch.load(path, map_location=DEVICE)
+    if isinstance(ckpt, dict) and "model" in ckpt and "phase" in ckpt:
+        return ckpt["model"]
+    return ckpt
+
+
 def load_models():
     vae = DrumVAE().to(DEVICE)
-    vae.load_state_dict(torch.load(f"{CFG.ckpt_dir}/vae_best.pt", map_location=DEVICE))
+    vae.load_state_dict(_load_state_dict(f"{CFG.ckpt_dir}/vae_best.pt"))
     vae.eval()
 
     dit = DrumDiT().to(DEVICE)
     dit.load_state_dict(
-        torch.load(f"{CFG.ckpt_dir}/dit_best.pt", map_location=DEVICE),
+        _load_state_dict(f"{CFG.ckpt_dir}/dit_best.pt"),
         strict=False,  # allows loading text-only checkpoints into ref-enabled model
     )
     dit.eval()
