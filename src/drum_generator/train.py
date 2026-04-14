@@ -30,6 +30,23 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ---------------------------------------------------------------------------
 
 
+def _unpack_batch(batch, device):
+    """Normalize DataLoader batch into (audio, clap, wav_pre).
+
+    MemmapDACDataset returns 3-tuples (dac_z, clap, wav_true_or_sentinel).
+    CachedDACDataset / DiskAudioDataset / others return 2-tuples (dac_z, clap).
+    This helper handles both, returning an empty-tensor sentinel for wav_pre
+    when the dataset doesn't provide pre-decoded waveforms.
+    """
+    audio = batch[0].to(device)
+    clap = batch[1].to(device)
+    if len(batch) > 2 and batch[2].numel() > 0:
+        wav_pre = batch[2].to(device)
+    else:
+        wav_pre = torch.empty(0, device=device)
+    return audio, clap, wav_pre
+
+
 def _build_stft_losses():
     """Build (linear_mrstft, mel_mrstft) pair based on CFG weights.
 
@@ -102,8 +119,13 @@ def train_vae(train_loader, val_loader):
             parts.append(f"mel(w={CFG.vae_stft_mel_weight})")
         print(f"[vae] STFT losses enabled: {' + '.join(parts)}")
 
-    def apply_stft(loss, dac_z, recon_z, no_grad_recon: bool):
+    def apply_stft(loss, dac_z, recon_z, wav_true_pre, no_grad_recon: bool):
         """Adds the STFT loss terms (linear + mel, as configured) to `loss`.
+
+        If `wav_true_pre` is a non-empty tensor (shape (B, T) > 0 samples),
+        it's used directly as the STFT loss target and the target-path DAC
+        decode is skipped — the pre-decoded path, ~40% faster per step.
+        Otherwise the target waveform is produced live via DAC decode.
 
         When `no_grad_recon` is True, the recon-path DAC decode skips
         gradient tracking (used during validation). Otherwise gradients
@@ -111,7 +133,10 @@ def train_vae(train_loader, val_loader):
         """
         if not stft_enabled:
             return loss
-        wav_true = decode_from_dac_latent(dac_z, DEVICE, no_grad=True)
+        if wav_true_pre is not None and wav_true_pre.numel() > 0:
+            wav_true = wav_true_pre
+        else:
+            wav_true = decode_from_dac_latent(dac_z, DEVICE, no_grad=True)
         wav_hat = decode_from_dac_latent(recon_z, DEVICE, no_grad=no_grad_recon)
         wh = wav_hat.unsqueeze(1)
         wt = wav_true.unsqueeze(1)
@@ -126,8 +151,8 @@ def train_vae(train_loader, val_loader):
         # --- train ---
         vae.train()
         train_loss = 0.0
-        for audio, _ in train_loader:  # ignore CLAP for VAE phase
-            audio = audio.to(DEVICE)
+        for batch in train_loader:  # ignore CLAP for VAE phase
+            audio, _clap, wav_true_pre = _unpack_batch(batch, DEVICE)
             # Detect cached DAC latents (3D) vs raw waveforms (2D)
             dac_z = audio if audio.dim() == 3 else encode_to_dac_latent(audio, DEVICE)
 
@@ -137,7 +162,7 @@ def train_vae(train_loader, val_loader):
             kl_w = min(CFG.vae_kl_weight, CFG.vae_kl_weight * epoch / CFG.vae_kl_warmup)
             loss, recon, kl = vae_loss(recon_z, dac_z, mu, logvar, kl_w)
 
-            loss = apply_stft(loss, dac_z, recon_z, no_grad_recon=False)
+            loss = apply_stft(loss, dac_z, recon_z, wav_true_pre, no_grad_recon=False)
 
             opt.zero_grad()
             loss.backward()
@@ -151,12 +176,12 @@ def train_vae(train_loader, val_loader):
         vae.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for audio, _ in val_loader:
-                audio = audio.to(DEVICE)
+            for batch in val_loader:
+                audio, _clap, wav_true_pre = _unpack_batch(batch, DEVICE)
                 dac_z = audio if audio.dim() == 3 else encode_to_dac_latent(audio, DEVICE)
                 recon_z, mu, logvar, _ = vae(dac_z)
                 loss, _, _ = vae_loss(recon_z, dac_z, mu, logvar, CFG.vae_kl_weight)
-                loss = apply_stft(loss, dac_z, recon_z, no_grad_recon=True)
+                loss = apply_stft(loss, dac_z, recon_z, wav_true_pre, no_grad_recon=True)
                 val_loss += loss.item()
 
         train_loss /= len(train_loader)
@@ -206,9 +231,8 @@ def train_dit(train_loader, val_loader, vae: DrumVAE):
         # --- train ---
         dit.train()
         train_loss = 0.0
-        for audio, clap_embeds in train_loader:
-            audio = audio.to(DEVICE)
-            clap_embeds = clap_embeds.to(DEVICE)
+        for batch in train_loader:
+            audio, clap_embeds, _wav = _unpack_batch(batch, DEVICE)
 
             # Encode to VAE latent (no grad — VAE is frozen)
             with torch.no_grad():
@@ -240,9 +264,8 @@ def train_dit(train_loader, val_loader, vae: DrumVAE):
         dit.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for audio, clap_embeds in val_loader:
-                audio = audio.to(DEVICE)
-                clap_embeds = clap_embeds.to(DEVICE)
+            for batch in val_loader:
+                audio, clap_embeds, _wav = _unpack_batch(batch, DEVICE)
                 dac_z = audio if audio.dim() == 3 else encode_to_dac_latent(audio, DEVICE)
                 mu, logvar = vae.encode(dac_z)
                 x1 = vae.reparameterize(mu, logvar)
