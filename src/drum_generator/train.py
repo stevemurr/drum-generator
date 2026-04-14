@@ -624,6 +624,15 @@ def main():
              f"Default: CFG.vae_eta_min ({CFG.vae_eta_min}).",
     )
     parser.add_argument(
+        "--vae-ckpt",
+        default=None,
+        help="Path to a trained VAE checkpoint to load for the DiT phase. "
+             "Overrides the default '{ckpt_dir}/vae_best.pt' lookup. "
+             "vae_latent_dim is auto-detected from the checkpoint, so you "
+             "don't need to pass --vae-latent-dim. Use this to run a DiT "
+             "training pass with a VAE checkpoint from a different ckpt_dir.",
+    )
+    parser.add_argument(
         "--dit-epochs",
         type=int,
         default=None,
@@ -916,12 +925,27 @@ def main():
 
     if args.phase in ("dit", "both"):
         print("\n=== Phase 2: DiT training ===")
-        vae = DrumVAE().to(DEVICE)
-        vae.load_state_dict(
-            _unwrap_model_state(
-                torch.load(f"{CFG.ckpt_dir}/vae_best.pt", map_location=DEVICE)
-            )
+        vae_ckpt_path = args.vae_ckpt or f"{CFG.ckpt_dir}/vae_best.pt"
+        print(f"[dit] loading VAE from: {vae_ckpt_path}")
+
+        # Load first, auto-detect vae_latent_dim from the mu_head shape, set
+        # CFG so DrumVAE *and* DrumDiT (which uses CFG.vae_latent_dim at
+        # construction time) both match the checkpoint.
+        vae_state = _unwrap_model_state(
+            torch.load(vae_ckpt_path, map_location=DEVICE, weights_only=False)
         )
+        mu_head = vae_state.get("encoder.mu_head.weight")
+        if mu_head is not None:
+            ckpt_latent_dim = mu_head.shape[0]
+            if ckpt_latent_dim != CFG.vae_latent_dim:
+                print(
+                    f"[dit] auto-detected vae_latent_dim={ckpt_latent_dim} "
+                    f"from checkpoint (was {CFG.vae_latent_dim})"
+                )
+                CFG.vae_latent_dim = ckpt_latent_dim
+
+        vae = DrumVAE().to(DEVICE)
+        vae.load_state_dict(vae_state)
         train_dit(train_loader, val_loader, vae, resume_state=resume_dit)
 
 
