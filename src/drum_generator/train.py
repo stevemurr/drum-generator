@@ -11,10 +11,8 @@ Run:
 
 import argparse
 import os
-import random
 import time
 
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
@@ -33,28 +31,6 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ---------------------------------------------------------------------------
 
 
-def _capture_rng() -> dict:
-    """Snapshot main-process RNG state (torch/cuda/numpy/python).
-
-    Worker-process RNGs are intentionally not captured — bit-exact resume
-    isn't a goal, just "approximately continue training".
-    """
-    return {
-        "torch": torch.get_rng_state(),
-        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-        "numpy": np.random.get_state(),
-        "python": random.getstate(),
-    }
-
-
-def _restore_rng(state: dict) -> None:
-    torch.set_rng_state(state["torch"])
-    if state.get("cuda") is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
-    np.random.set_state(state["numpy"])
-    random.setstate(state["python"])
-
-
 def _save_ckpt(
     path: str,
     *,
@@ -65,7 +41,12 @@ def _save_ckpt(
     epoch: int,
     best_val: float,
 ) -> None:
-    """Atomic dict-format checkpoint write: tmp file + rename."""
+    """Atomic dict-format checkpoint write: tmp file + rename.
+
+    Deliberately excludes RNG state — resume is "approximately continue",
+    not bit-exact, and keeping the dict to torch/python primitives lets
+    torch.load use its safer weights_only=True default.
+    """
     ckpt = {
         "phase": phase,
         "model": model.state_dict(),
@@ -73,7 +54,6 @@ def _save_ckpt(
         "scheduler": scheduler.state_dict(),
         "epoch": epoch,
         "best_val": best_val,
-        "rng": _capture_rng(),
     }
     tmp = path + ".tmp"
     torch.save(ckpt, tmp)
@@ -178,7 +158,6 @@ def train_vae(train_loader, val_loader, resume_state: dict | None = None):
         sch.load_state_dict(resume_state["scheduler"])
         start_epoch = resume_state["epoch"] + 1
         best_val = resume_state["best_val"]
-        _restore_rng(resume_state["rng"])
         print(
             f"[vae] resumed from epoch {resume_state['epoch']} "
             f"(best_val={best_val:.5f}), continuing at epoch {start_epoch}"
@@ -332,7 +311,6 @@ def train_dit(train_loader, val_loader, vae: DrumVAE, resume_state: dict | None 
         sch.load_state_dict(resume_state["scheduler"])
         start_epoch = resume_state["epoch"] + 1
         best_val = resume_state["best_val"]
-        _restore_rng(resume_state["rng"])
         print(
             f"[dit] resumed from epoch {resume_state['epoch']} "
             f"(best_val={best_val:.5f}), continuing at epoch {start_epoch}"
@@ -558,7 +536,7 @@ def main():
         default=None,
         help="Path to a checkpoint (vae_last.pt / vae_best.pt / dit_last.pt / "
              "dit_best.pt) to resume training from. Restores model, optimizer, "
-             "scheduler, epoch counter, best_val, and main-process RNG. The "
+             "scheduler, epoch counter, and best_val. The "
              "checkpoint's phase must match --phase, and its scheduler T_max "
              "must match the current --{phase}-epochs value.",
     )
