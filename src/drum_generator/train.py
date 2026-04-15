@@ -653,6 +653,34 @@ def main():
              f"Default: CFG.dit_eta_min ({CFG.dit_eta_min}).",
     )
     parser.add_argument(
+        "--dit-dim",
+        type=int,
+        default=None,
+        help=f"DiT transformer hidden dimension. Must be divisible by "
+             f"--dit-heads. Bigger = more capacity, ~quadratic memory and "
+             f"compute. NOTE: changing this invalidates any existing "
+             f"dit_best.pt / dit_last.pt. "
+             f"Default: CFG.dit_dim ({CFG.dit_dim}).",
+    )
+    parser.add_argument(
+        "--dit-heads",
+        type=int,
+        default=None,
+        help=f"Number of attention heads in each DiT block. --dit-dim must "
+             f"be divisible by this. 4 / 8 / 12 / 16 are common choices. "
+             f"NOTE: changing this invalidates any existing dit checkpoint. "
+             f"Default: CFG.dit_heads ({CFG.dit_heads}).",
+    )
+    parser.add_argument(
+        "--dit-layers",
+        type=int,
+        default=None,
+        help=f"Number of DiT transformer blocks (depth). Linear scaling in "
+             f"memory/compute. NOTE: changing this invalidates any existing "
+             f"dit checkpoint. "
+             f"Default: CFG.dit_layers ({CFG.dit_layers}).",
+    )
+    parser.add_argument(
         "--vae-kl-weight",
         type=float,
         default=None,
@@ -811,6 +839,25 @@ def main():
     if args.dit_eta_min is not None:
         CFG.dit_eta_min = args.dit_eta_min
         print(f"[train] dit_eta_min: {args.dit_eta_min}")
+
+    if args.dit_dim is not None:
+        CFG.dit_dim = args.dit_dim
+        print(f"[train] dit_dim: {args.dit_dim}")
+
+    if args.dit_heads is not None:
+        CFG.dit_heads = args.dit_heads
+        print(f"[train] dit_heads: {args.dit_heads}")
+
+    if args.dit_layers is not None:
+        CFG.dit_layers = args.dit_layers
+        print(f"[train] dit_layers: {args.dit_layers}")
+
+    # Standard multi-head attention constraint
+    if CFG.dit_dim % CFG.dit_heads != 0:
+        raise SystemExit(
+            f"--dit-dim ({CFG.dit_dim}) must be divisible by "
+            f"--dit-heads ({CFG.dit_heads})"
+        )
 
     if args.dit_epochs is not None:
         CFG.dit_epochs = args.dit_epochs
