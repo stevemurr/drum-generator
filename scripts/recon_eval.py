@@ -118,6 +118,35 @@ def log_mel(wav: np.ndarray) -> np.ndarray:
     return np.log(M + 1e-7)
 
 
+def crest_factor(wav: np.ndarray) -> float:
+    """peak / RMS — high value = sharp transient, low value = smeared energy."""
+    wav = wav.astype(np.float32)
+    rms = float(np.sqrt(np.mean(wav ** 2)))
+    if rms < 1e-12:
+        return 0.0
+    return float(np.abs(wav).max() / rms)
+
+
+def attack_ms(wav: np.ndarray) -> float:
+    """Time from 10%-of-peak onset to peak amplitude, in milliseconds.
+
+    Uses a squared-signal envelope with 2ms smoothing. Robust for short
+    drum one-shots; doesn't depend on pitch tracking.
+    """
+    wav = wav.astype(np.float32)
+    env = wav ** 2
+    win = max(1, int(SR * 0.002))  # 2ms smoothing
+    env = np.convolve(env, np.ones(win) / win, mode="same")
+    peak_idx = int(np.argmax(env))
+    peak = env[peak_idx]
+    if peak < 1e-10:
+        return 0.0
+    threshold = peak * 0.1
+    onset_candidates = np.where(env[:peak_idx] > threshold)[0]
+    onset_idx = int(onset_candidates[0]) if len(onset_candidates) > 0 else 0
+    return max(peak_idx - onset_idx, 0) * 1000.0 / SR
+
+
 @torch.no_grad()
 def recon_batch(vae: DrumVAE, dac_batch: np.ndarray) -> np.ndarray:
     """(B, 1024, 129) numpy → (B, 66048) waveform numpy via mu-only decode."""
@@ -177,6 +206,10 @@ def main():
     centroid_hat = np.zeros(n, dtype=np.float32)
     lbr_true = np.zeros(n, dtype=np.float32)
     lbr_hat = np.zeros(n, dtype=np.float32)
+    crest_true = np.zeros(n, dtype=np.float32)
+    crest_hat = np.zeros(n, dtype=np.float32)
+    attack_true = np.zeros(n, dtype=np.float32)
+    attack_hat = np.zeros(n, dtype=np.float32)
     mel_errors = np.zeros((n, N_MELS), dtype=np.float32)
 
     B = args.batch_size
@@ -194,6 +227,10 @@ def main():
             centroid_hat[cursor + j] = spectral_centroid(wh)
             lbr_true[cursor + j] = low_band_ratio(wt)
             lbr_hat[cursor + j] = low_band_ratio(wh)
+            crest_true[cursor + j] = crest_factor(wt)
+            crest_hat[cursor + j] = crest_factor(wh)
+            attack_true[cursor + j] = attack_ms(wt)
+            attack_hat[cursor + j] = attack_ms(wh)
             mel_errors[cursor + j] = np.abs(log_mel(wh) - log_mel(wt)).mean(axis=1)
 
         cursor += len(chunk)
@@ -202,6 +239,8 @@ def main():
 
     centroid_delta = centroid_hat - centroid_true
     lbr_delta = lbr_hat - lbr_true
+    crest_delta = crest_hat - crest_true
+    attack_delta = attack_hat - attack_true
 
     print(f"\n=== recon eval: {n} samples ===\n")
 
@@ -227,6 +266,30 @@ def main():
     thinner = int((lbr_delta < 0).sum())
     print(f"  samples with less sub-bass than truth: {thinner}/{n} ({100*thinner/n:.1f}%)")
 
+    print(f"\ncrest factor (peak/RMS) — 'transient sharpness'")
+    print(f"  true:   median={np.median(crest_true):.2f}  mean={crest_true.mean():.2f}")
+    print(f"  recon:  median={np.median(crest_hat):.2f}  mean={crest_hat.mean():.2f}")
+    print(
+        f"  delta:  median={np.median(crest_delta):+.2f}  "
+        f"mean={crest_delta.mean():+.2f}  "
+        f"p25={pct(crest_delta,25):+.2f}  p75={pct(crest_delta,75):+.2f}"
+    )
+    softer = int((crest_delta < 0).sum())
+    print(f"  samples with lower crest factor (softer transient): "
+          f"{softer}/{n} ({100*softer/n:.1f}%)")
+
+    print(f"\nattack time (ms) — 'onset to peak amplitude'")
+    print(f"  true:   median={np.median(attack_true):.1f}  mean={attack_true.mean():.1f}")
+    print(f"  recon:  median={np.median(attack_hat):.1f}  mean={attack_hat.mean():.1f}")
+    print(
+        f"  delta:  median={np.median(attack_delta):+.1f}  "
+        f"mean={attack_delta.mean():+.1f}  "
+        f"p25={pct(attack_delta,25):+.1f}  p75={pct(attack_delta,75):+.1f}"
+    )
+    slower = int((attack_delta > 0).sum())
+    print(f"  samples with slower attack than truth: "
+          f"{slower}/{n} ({100*slower/n:.1f}%)")
+
     print(f"\nper-mel-band log-magnitude L1 error (mean across time, median across samples)")
     median_per_band = np.median(mel_errors, axis=0)
     mel_freqs = librosa.mel_frequencies(n_mels=N_MELS, fmax=SR / 2)
@@ -247,6 +310,8 @@ def main():
         "n": n,
         "centroid_shift_median_hz": float(np.median(centroid_delta)),
         "low_band_ratio_delta_median": float(np.median(lbr_delta)),
+        "crest_delta_median": float(np.median(crest_delta)),
+        "attack_delta_median_ms": float(np.median(attack_delta)),
         "mel_error_mean": float(median_per_band.mean()),
     }
     print(f"\nsummary: {json.dumps(summary)}")
