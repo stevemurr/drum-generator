@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader, random_split
 from drum_generator.codec import decode_from_dac_latent, encode_to_dac_latent, set_dac_optim
 from drum_generator.config import CFG
 from drum_generator.dataset import build_dataset
-from drum_generator.dit import DrumDiT, flow_matching_loss
+from drum_generator.dit import DrumDiT, flow_matching_forward, flow_matching_loss
 from drum_generator.vae import DrumVAE, vae_loss
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -224,6 +224,86 @@ class LowpassL1Loss(nn.Module):
         wh_lp = F.conv1d(wh, self.kernel)
         wt_lp = F.conv1d(wt, self.kernel)
         return F.l1_loss(wh_lp, wt_lp)
+
+
+# ---------------------------------------------------------------------------
+# DiT auxiliary waveform-space losses (onset-weighted mel + temporal derivative)
+# ---------------------------------------------------------------------------
+
+
+class OnsetWeightedMelLoss(nn.Module):
+    """Log-mel L1 with a per-frame onset-strength weighting mask.
+
+    The flow-matching objective alone doesn't penalize temporal smearing
+    in waveform space because it operates in VAE latent space. This loss
+    decodes the predicted clean latent through VAE -> DAC -> waveform,
+    computes a log-mel spectrogram, and penalizes L1 error with a
+    per-frame weight derived from the ground-truth onset strength
+    (spectral flux) — heavier at transient frames, lighter elsewhere.
+
+    Targets the 'blob kick' failure where generated transients are
+    smeared: onset frames get 1 + onset_boost * (normalized flux),
+    which directly pushes gradient toward matching the ground-truth
+    attack shape.
+    """
+
+    def __init__(
+        self,
+        sample_rate: int = 44100,
+        n_fft: int = 1024,
+        hop_length: int = 256,
+        n_mels: int = 64,
+        onset_boost: float = 3.0,
+        eps: float = 1e-7,
+    ):
+        super().__init__()
+        from torchaudio.transforms import MelSpectrogram
+
+        self.mel = MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            n_mels=n_mels,
+            power=2.0,
+        )
+        self.onset_boost = onset_boost
+        self.eps = eps
+
+    def forward(self, wav_hat: torch.Tensor, wav_true: torch.Tensor) -> torch.Tensor:
+        # wav_* shape: (B, T_samples)
+        mel_hat = torch.log(self.mel(wav_hat) + self.eps)    # (B, n_mels, T_frames)
+        mel_true = torch.log(self.mel(wav_true) + self.eps)
+
+        # Onset strength = positive spectral flux (sum over mel bins of
+        # clamped frame-to-frame increases in log-mag).
+        flux = (mel_true[:, :, 1:] - mel_true[:, :, :-1]).clamp(min=0.0).sum(dim=1)
+        # Pad one frame at the start so shape matches mel's T_frames.
+        flux = F.pad(flux, (1, 0), mode="replicate")  # (B, T_frames)
+
+        # Per-batch normalization: scale so max flux in each sample = 1.
+        flux_max = flux.max(dim=1, keepdim=True).values.clamp(min=self.eps)
+        flux_norm = flux / flux_max
+
+        # Weight curve: baseline 1, boosted at onsets.
+        weight = 1.0 + self.onset_boost * flux_norm      # (B, T_frames)
+        weight = weight.unsqueeze(1)                      # (B, 1, T_frames)
+
+        err = (mel_hat - mel_true).abs()
+        return (err * weight).mean()
+
+
+def temporal_derivative_loss(wav_hat: torch.Tensor, wav_true: torch.Tensor) -> torch.Tensor:
+    """L1 on the first-order finite difference of both waveforms.
+
+    Smeared outputs have smaller d/dt magnitudes at transient boundaries
+    than sharp ones; penalizing the L1 distance between derivatives
+    provides a direct gradient signal against temporal smoothing. Cheap
+    (one subtraction per sample, no STFT), so it composes well with the
+    onset-weighted mel loss without meaningfully increasing per-step cost.
+    """
+    dwh = wav_hat[:, 1:] - wav_hat[:, :-1]
+    dwt = wav_true[:, 1:] - wav_true[:, :-1]
+    return (dwh - dwt).abs().mean()
 
 
 def _build_stft_losses():
@@ -487,31 +567,115 @@ def train_dit(train_loader, val_loader, vae: DrumVAE, resume_state: dict | None 
             f"(best_val={best_val:.5f}), continuing at epoch {start_epoch}"
         )
 
+    # Build auxiliary waveform-space losses (onset-weighted mel + temporal
+    # derivative). Both are optional; each gated by its own weight in CFG.
+    onset_mel_loss = None
+    if CFG.dit_onset_mel_weight > 0:
+        onset_mel_loss = OnsetWeightedMelLoss(sample_rate=CFG.sample_rate).to(DEVICE)
+    tderiv_enabled = CFG.dit_tderiv_weight > 0
+    aux_enabled = onset_mel_loss is not None or tderiv_enabled
+
+    if aux_enabled:
+        parts = []
+        if onset_mel_loss is not None:
+            parts.append(f"onset-mel(w={CFG.dit_onset_mel_weight})")
+        if tderiv_enabled:
+            parts.append(f"tderiv(w={CFG.dit_tderiv_weight})")
+        schedule = ""
+        if CFG.dit_aux_every_n > 1:
+            schedule += f" every {CFG.dit_aux_every_n} steps"
+        if CFG.dit_aux_decode_frames > 0:
+            schedule += f", decode {CFG.dit_aux_decode_frames} frames"
+        print(f"[dit] aux losses enabled: {' + '.join(parts)}{schedule}")
+
+    aux_step_counter = 0
+
     for epoch in range(start_epoch, CFG.dit_epochs + 1):
         epoch_start = time.time()
         # --- train ---
         dit.train()
         train_loss = 0.0
         for batch in train_loader:
-            audio, clap_embeds, _wav = _unpack_batch(batch, DEVICE)
+            audio, clap_embeds, wav_true_pre = _unpack_batch(batch, DEVICE)
 
             # Encode to VAE latent (no grad — VAE is frozen)
             with torch.no_grad():
                 dac_z = audio if audio.dim() == 3 else encode_to_dac_latent(audio, DEVICE)
                 mu, logvar = vae.encode(dac_z)
-                x1 = vae.reparameterize(mu, logvar)  # (B, 16, T)
+                x1 = vae.reparameterize(mu, logvar)  # (B, vae_latent_dim, T)
 
             # Create reference by shuffling batch (no self-reference)
             B = x1.shape[0]
             perm = _derangement(B, device=x1.device)
-            ref_z = x1[perm]  # (B, 16, T) — reuse already-computed latents
+            ref_z = x1[perm]
 
-            loss = flow_matching_loss(
-                dit, x1, clap_embeds,
-                ref_z=ref_z,
-                cfg_dropout=CFG.cfg_dropout,
-                ref_dropout=CFG.ref_dropout,
-            )
+            if aux_enabled:
+                # Path WITH aux losses: use flow_matching_forward so we can
+                # reconstruct x1_pred = x_t + (1-t) * v_pred and push that
+                # through VAE + DAC to a waveform for the aux loss.
+                v_pred, v_target, x_t, t = flow_matching_forward(
+                    dit, x1, clap_embeds,
+                    ref_z=ref_z,
+                    cfg_dropout=CFG.cfg_dropout,
+                    ref_dropout=CFG.ref_dropout,
+                )
+                fm_loss = F.mse_loss(v_pred, v_target)
+                loss = fm_loss
+
+                compute_aux = (aux_step_counter % CFG.dit_aux_every_n) == 0
+                aux_step_counter += 1
+                if compute_aux:
+                    t_b = t.view(B, 1, 1)
+                    x1_pred = x_t + (1.0 - t_b) * v_pred
+
+                    # Optionally truncate to the first N frames along time
+                    # axis before VAE + DAC decode. Cheaper decode, and the
+                    # transient region is in the front of the clip anyway.
+                    if CFG.dit_aux_decode_frames > 0:
+                        K = min(CFG.dit_aux_decode_frames, x1_pred.shape[-1])
+                        x1_pred_slice = x1_pred[..., :K]
+                        x1_slice = x1[..., :K]
+                    else:
+                        x1_pred_slice = x1_pred
+                        x1_slice = x1
+
+                    # Decode predicted clean latent through VAE (with grad)
+                    # then DAC (grad required for aux loss to reach dit).
+                    dac_z_hat = vae.decode(x1_pred_slice)
+                    wav_hat = decode_from_dac_latent(dac_z_hat, DEVICE, no_grad=False)
+
+                    # Target waveform: slice pre-decoded or decode from dac_z.
+                    if wav_true_pre is not None and wav_true_pre.numel() > 0:
+                        wav_true = wav_true_pre[:, : wav_hat.shape[-1]]
+                    else:
+                        with torch.no_grad():
+                            dac_z_true = vae.decode(x1_slice)
+                            wav_true = decode_from_dac_latent(
+                                dac_z_true, DEVICE, no_grad=True
+                            )[:, : wav_hat.shape[-1]]
+
+                    # Align lengths (decode may produce slightly fewer samples
+                    # than the slice suggests due to DAC output math).
+                    T_min = min(wav_hat.shape[-1], wav_true.shape[-1])
+                    wav_hat = wav_hat[:, :T_min]
+                    wav_true = wav_true[:, :T_min]
+
+                    if onset_mel_loss is not None:
+                        loss = loss + CFG.dit_onset_mel_weight * onset_mel_loss(
+                            wav_hat, wav_true
+                        )
+                    if tderiv_enabled:
+                        loss = loss + CFG.dit_tderiv_weight * temporal_derivative_loss(
+                            wav_hat, wav_true
+                        )
+            else:
+                # Fast path: pure flow-matching MSE, no aux losses.
+                loss = flow_matching_loss(
+                    dit, x1, clap_embeds,
+                    ref_z=ref_z,
+                    cfg_dropout=CFG.cfg_dropout,
+                    ref_dropout=CFG.ref_dropout,
+                )
 
             opt.zero_grad()
             loss.backward()
@@ -679,6 +843,52 @@ def main():
              f"memory/compute. NOTE: changing this invalidates any existing "
              f"dit checkpoint. "
              f"Default: CFG.dit_layers ({CFG.dit_layers}).",
+    )
+    parser.add_argument(
+        "--dit-onset-mel-weight",
+        type=float,
+        default=None,
+        help=f"Weight for the onset-weighted log-mel L1 loss applied to "
+             f"VAE+DAC-decoded predicted clean latent vs ground-truth "
+             f"waveform. Adds a waveform-space gradient signal that directly "
+             f"penalizes smeared transients, which pure flow-matching MSE in "
+             f"latent space doesn't see. 0 disables. Typical values 0.5-2.0. "
+             f"Composes with --dit-aux-decode-frames and --dit-aux-every-n "
+             f"to control the compute cost. "
+             f"Default: CFG.dit_onset_mel_weight ({CFG.dit_onset_mel_weight}).",
+    )
+    parser.add_argument(
+        "--dit-tderiv-weight",
+        type=float,
+        default=None,
+        help=f"Weight for the temporal-derivative L1 loss (L1 on the first "
+             f"finite difference of both waveforms). Cheap supplementary "
+             f"signal against temporal smoothing — smeared outputs have "
+             f"smaller d/dt at transient boundaries. 0 disables. Typical "
+             f"values 0.1-0.5. "
+             f"Default: CFG.dit_tderiv_weight ({CFG.dit_tderiv_weight}).",
+    )
+    parser.add_argument(
+        "--dit-aux-decode-frames",
+        type=int,
+        default=None,
+        help=f"DAC latent frames to decode for the aux loss (0 = all 129, "
+             f"i.e. full 1.5s waveform). Truncating to e.g. 24 (~280ms) "
+             f"cuts the aux-loss DAC decode cost roughly proportionally "
+             f"while still covering the transient region, which is where "
+             f"the onset loss lives. Edge effects at the truncation "
+             f"boundary cancel between wav_hat and wav_true. "
+             f"Default: CFG.dit_aux_decode_frames ({CFG.dit_aux_decode_frames}).",
+    )
+    parser.add_argument(
+        "--dit-aux-every-n",
+        type=int,
+        default=None,
+        help=f"Compute the aux loss only every Nth training step (1 = every "
+             f"step). Gradient signal becomes 1/N as dense but Adam still "
+             f"integrates it into the running moments. Multiplicatively "
+             f"composes with --dit-aux-decode-frames for compute control. "
+             f"Default: CFG.dit_aux_every_n ({CFG.dit_aux_every_n}).",
     )
     parser.add_argument(
         "--vae-kl-weight",
@@ -851,6 +1061,22 @@ def main():
     if args.dit_layers is not None:
         CFG.dit_layers = args.dit_layers
         print(f"[train] dit_layers: {args.dit_layers}")
+
+    if args.dit_onset_mel_weight is not None:
+        CFG.dit_onset_mel_weight = args.dit_onset_mel_weight
+        print(f"[train] dit_onset_mel_weight: {args.dit_onset_mel_weight}")
+
+    if args.dit_tderiv_weight is not None:
+        CFG.dit_tderiv_weight = args.dit_tderiv_weight
+        print(f"[train] dit_tderiv_weight: {args.dit_tderiv_weight}")
+
+    if args.dit_aux_decode_frames is not None:
+        CFG.dit_aux_decode_frames = args.dit_aux_decode_frames
+        print(f"[train] dit_aux_decode_frames: {args.dit_aux_decode_frames}")
+
+    if args.dit_aux_every_n is not None:
+        CFG.dit_aux_every_n = args.dit_aux_every_n
+        print(f"[train] dit_aux_every_n: {args.dit_aux_every_n}")
 
     # Standard multi-head attention constraint
     if CFG.dit_dim % CFG.dit_heads != 0:

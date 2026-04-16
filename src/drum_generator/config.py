@@ -46,6 +46,18 @@ class Config:
     vae_lowpass_cutoff: float = 500.0  # lowpass cutoff in Hz for the L1 term
     dit_epochs: int = 500
     dit_eta_min: float = 0.0  # CosineAnnealingLR floor (0 = schedule ends at 0 LR)
+    # Auxiliary waveform-space losses for DiT training (0 disables each).
+    # See OnsetWeightedMelLoss / temporal_derivative_loss in train.py.
+    dit_onset_mel_weight: float = 0.0
+    dit_tderiv_weight: float = 0.0
+    # Cost controls for aux losses:
+    #   dit_aux_decode_frames — DAC latent frames to decode per step (0 = all
+    #     129 ≈ full 1.5s waveform). Truncating to e.g. 24 frames (~280ms)
+    #     is cheaper and still covers the transient region.
+    #   dit_aux_every_n — compute aux loss only every Nth training step
+    #     (1 = every step).
+    dit_aux_decode_frames: int = 0
+    dit_aux_every_n: int = 1
     cfg_dropout: float = 0.1  # prob of dropping text cond (CFG training)
     cfg_scale: float = 4.0  # guidance scale at inference
     ref_dropout: float = 0.5  # prob of dropping audio reference (high → text-only works well)

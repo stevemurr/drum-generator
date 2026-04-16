@@ -237,25 +237,28 @@ class DrumDiT(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def flow_matching_loss(
+def flow_matching_forward(
     dit: DrumDiT,
-    x1: torch.Tensor,  # (B, 16, T) — clean VAE latent
+    x1: torch.Tensor,  # (B, vae_latent_dim, T) — clean VAE latent
     clap_embed: torch.Tensor,  # (B, 512)
-    ref_z: torch.Tensor | None = None,  # (B, 16, T) — reference VAE latent
+    ref_z: torch.Tensor | None = None,
     cfg_dropout: float = CFG.cfg_dropout,
     ref_dropout: float = CFG.ref_dropout,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One flow-matching training step forward pass.
+
+    Returns (v_pred, v_target, x_t, t) so callers that want to compute
+    auxiliary losses in waveform space can reconstruct the predicted
+    clean latent via x1_pred = x_t + (1 - t) * v_pred.
+    """
     B = x1.shape[0]
     device = x1.device
 
-    # Sample noise and timestep
     x0 = torch.randn_like(x1)
     t = torch.rand(B, device=device)
-
-    # Interpolate: straight-line path
     t_b = t.view(B, 1, 1)
-    x_t = (1 - t_b) * x0 + t_b * x1  # noisy latent at time t
-    v_target = x1 - x0  # constant velocity (straight line)
+    x_t = (1 - t_b) * x0 + t_b * x1
+    v_target = x1 - x0  # straight-line constant velocity
 
     # Classifier-free guidance: randomly null-out CLAP conditioning
     if cfg_dropout > 0:
@@ -268,6 +271,20 @@ def flow_matching_loss(
         ref_z = ref_z * (1 - ref_mask[:, None, None])
 
     v_pred = dit(x_t, t, clap_embed, ref_z=ref_z)
+    return v_pred, v_target, x_t, t
+
+
+def flow_matching_loss(
+    dit: DrumDiT,
+    x1: torch.Tensor,
+    clap_embed: torch.Tensor,
+    ref_z: torch.Tensor | None = None,
+    cfg_dropout: float = CFG.cfg_dropout,
+    ref_dropout: float = CFG.ref_dropout,
+) -> torch.Tensor:
+    v_pred, v_target, _, _ = flow_matching_forward(
+        dit, x1, clap_embed, ref_z, cfg_dropout, ref_dropout
+    )
     return F.mse_loss(v_pred, v_target)
 
 
