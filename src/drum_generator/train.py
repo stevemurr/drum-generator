@@ -684,7 +684,7 @@ def train_dit(train_loader, val_loader, vae: DrumVAE, resume_state: dict | None 
                 compute_aux = (aux_step_counter % max(CFG.dit_aux_every_n, 1)) == 0
                 aux_step_counter += 1
                 if compute_aux or adv_enabled:
-                    decode_frames = CFG.dit_aux_decode_frames if not adv_enabled else 0
+                    decode_frames = CFG.dit_aux_decode_frames
                     wav_hat, wav_true = _decode_x1_pred(
                         vae, v_pred, x_t, t, x1, wav_true_pre,
                         decode_frames=decode_frames,
