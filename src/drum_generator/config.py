@@ -58,6 +58,10 @@ class Config:
     #     (1 = every step).
     dit_aux_decode_frames: int = 0
     dit_aux_every_n: int = 1
+    # Adversarial training (MPD + MSD discriminators)
+    dit_adv_weight: float = 0.0  # adversarial loss weight (0 disables)
+    dit_fm_weight: float = 0.0  # feature-matching loss weight
+    dit_disc_lr_mult: float = 2.0  # discriminator LR = lr * this multiplier
     cfg_dropout: float = 0.1  # prob of dropping text cond (CFG training)
     cfg_scale: float = 4.0  # guidance scale at inference
     ref_dropout: float = 0.5  # prob of dropping audio reference (high → text-only works well)

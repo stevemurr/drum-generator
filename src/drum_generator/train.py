@@ -546,6 +546,37 @@ def _derangement(n: int, device: str = "cpu") -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
+def _decode_x1_pred(vae, v_pred, x_t, t, x1, wav_true_pre, decode_frames=0):
+    """Reconstruct x1 from the flow-matching prediction, decode to waveform.
+
+    Returns (wav_hat, wav_true) with matching lengths, or (None, None)
+    if decode is not needed. wav_hat carries gradient back to the DiT.
+    """
+    B = v_pred.shape[0]
+    t_b = t.view(B, 1, 1)
+    x1_pred = x_t + (1.0 - t_b) * v_pred
+
+    if decode_frames > 0:
+        K = min(decode_frames, x1_pred.shape[-1])
+        x1_pred = x1_pred[..., :K]
+        x1 = x1[..., :K]
+
+    dac_z_hat = vae.decode(x1_pred)
+    wav_hat = decode_from_dac_latent(dac_z_hat, DEVICE, no_grad=False)
+
+    if wav_true_pre is not None and wav_true_pre.numel() > 0:
+        wav_true = wav_true_pre[:, : wav_hat.shape[-1]]
+    else:
+        with torch.no_grad():
+            dac_z_true = vae.decode(x1)
+            wav_true = decode_from_dac_latent(
+                dac_z_true, DEVICE, no_grad=True
+            )[:, : wav_hat.shape[-1]]
+
+    T_min = min(wav_hat.shape[-1], wav_true.shape[-1])
+    return wav_hat[:, :T_min], wav_true[:, :T_min]
+
+
 def train_dit(train_loader, val_loader, vae: DrumVAE, resume_state: dict | None = None):
     dit = DrumDiT().to(DEVICE)
     opt = torch.optim.AdamW(dit.parameters(), lr=CFG.lr, weight_decay=1e-4)
@@ -567,8 +598,33 @@ def train_dit(train_loader, val_loader, vae: DrumVAE, resume_state: dict | None 
             f"(best_val={best_val:.5f}), continuing at epoch {start_epoch}"
         )
 
-    # Build auxiliary waveform-space losses (onset-weighted mel + temporal
-    # derivative). Both are optional; each gated by its own weight in CFG.
+    # --- Adversarial training (MPD + MSD) ---
+    adv_enabled = CFG.dit_adv_weight > 0 or CFG.dit_fm_weight > 0
+    mpd = msd = disc_opt = None
+    if adv_enabled:
+        from drum_generator.discriminator import (
+            MultiPeriodDiscriminator,
+            MultiScaleDiscriminator,
+            discriminator_loss as disc_loss_fn,
+            generator_loss as gen_loss_fn,
+            feature_matching_loss as fm_loss_fn,
+        )
+
+        mpd = MultiPeriodDiscriminator().to(DEVICE)
+        msd = MultiScaleDiscriminator().to(DEVICE)
+        disc_params = list(mpd.parameters()) + list(msd.parameters())
+        disc_opt = torch.optim.AdamW(
+            disc_params,
+            lr=CFG.lr * CFG.dit_disc_lr_mult,
+            weight_decay=1e-4,
+        )
+        print(
+            f"[dit] adversarial training enabled: "
+            f"adv_w={CFG.dit_adv_weight}, fm_w={CFG.dit_fm_weight}, "
+            f"disc_lr={CFG.lr * CFG.dit_disc_lr_mult:.1e}"
+        )
+
+    # --- Auxiliary waveform-space losses (onset-weighted mel + tderiv) ---
     onset_mel_loss = None
     if CFG.dit_onset_mel_weight > 0:
         onset_mel_loss = OnsetWeightedMelLoss(sample_rate=CFG.sample_rate).to(DEVICE)
@@ -588,94 +644,90 @@ def train_dit(train_loader, val_loader, vae: DrumVAE, resume_state: dict | None 
             schedule += f", decode {CFG.dit_aux_decode_frames} frames"
         print(f"[dit] aux losses enabled: {' + '.join(parts)}{schedule}")
 
+    # Whether we need to decode waveforms at all during training
+    need_wav = adv_enabled or aux_enabled
     aux_step_counter = 0
 
     for epoch in range(start_epoch, CFG.dit_epochs + 1):
         epoch_start = time.time()
         # --- train ---
         dit.train()
+        if mpd is not None:
+            mpd.train()
+            msd.train()
         train_loss = 0.0
+
         for batch in train_loader:
             audio, clap_embeds, wav_true_pre = _unpack_batch(batch, DEVICE)
 
-            # Encode to VAE latent (no grad — VAE is frozen)
             with torch.no_grad():
                 dac_z = audio if audio.dim() == 3 else encode_to_dac_latent(audio, DEVICE)
                 mu, logvar = vae.encode(dac_z)
-                x1 = vae.reparameterize(mu, logvar)  # (B, vae_latent_dim, T)
+                x1 = vae.reparameterize(mu, logvar)
 
-            # Create reference by shuffling batch (no self-reference)
             B = x1.shape[0]
             perm = _derangement(B, device=x1.device)
             ref_z = x1[perm]
 
-            if aux_enabled:
-                # Path WITH aux losses: use flow_matching_forward so we can
-                # reconstruct x1_pred = x_t + (1-t) * v_pred and push that
-                # through VAE + DAC to a waveform for the aux loss.
-                v_pred, v_target, x_t, t = flow_matching_forward(
-                    dit, x1, clap_embeds,
-                    ref_z=ref_z,
-                    cfg_dropout=CFG.cfg_dropout,
-                    ref_dropout=CFG.ref_dropout,
-                )
-                fm_loss = F.mse_loss(v_pred, v_target)
-                loss = fm_loss
+            # Flow-matching forward (always needed)
+            v_pred, v_target, x_t, t = flow_matching_forward(
+                dit, x1, clap_embeds,
+                ref_z=ref_z,
+                cfg_dropout=CFG.cfg_dropout,
+                ref_dropout=CFG.ref_dropout,
+            )
+            fm_base = F.mse_loss(v_pred, v_target)
 
-                compute_aux = (aux_step_counter % CFG.dit_aux_every_n) == 0
+            # Decode to waveform if any waveform-space loss is active
+            wav_hat = wav_true = None
+            if need_wav:
+                compute_aux = (aux_step_counter % max(CFG.dit_aux_every_n, 1)) == 0
                 aux_step_counter += 1
-                if compute_aux:
-                    t_b = t.view(B, 1, 1)
-                    x1_pred = x_t + (1.0 - t_b) * v_pred
+                if compute_aux or adv_enabled:
+                    decode_frames = CFG.dit_aux_decode_frames if not adv_enabled else 0
+                    wav_hat, wav_true = _decode_x1_pred(
+                        vae, v_pred, x_t, t, x1, wav_true_pre,
+                        decode_frames=decode_frames,
+                    )
 
-                    # Optionally truncate to the first N frames along time
-                    # axis before VAE + DAC decode. Cheaper decode, and the
-                    # transient region is in the front of the clip anyway.
-                    if CFG.dit_aux_decode_frames > 0:
-                        K = min(CFG.dit_aux_decode_frames, x1_pred.shape[-1])
-                        x1_pred_slice = x1_pred[..., :K]
-                        x1_slice = x1[..., :K]
-                    else:
-                        x1_pred_slice = x1_pred
-                        x1_slice = x1
+            # --- Discriminator update ---
+            if adv_enabled and wav_hat is not None:
+                disc_opt.zero_grad()
+                with torch.no_grad():
+                    wav_hat_d = wav_hat.detach()
+                mpd_real = mpd(wav_true)
+                mpd_fake = mpd(wav_hat_d)
+                msd_real = msd(wav_true)
+                msd_fake = msd(wav_hat_d)
+                d_loss = disc_loss_fn(mpd_real, mpd_fake) + disc_loss_fn(msd_real, msd_fake)
+                d_loss.backward()
+                disc_opt.step()
 
-                    # Decode predicted clean latent through VAE (with grad)
-                    # then DAC (grad required for aux loss to reach dit).
-                    dac_z_hat = vae.decode(x1_pred_slice)
-                    wav_hat = decode_from_dac_latent(dac_z_hat, DEVICE, no_grad=False)
+            # --- Generator update ---
+            loss = fm_base
 
-                    # Target waveform: slice pre-decoded or decode from dac_z.
-                    if wav_true_pre is not None and wav_true_pre.numel() > 0:
-                        wav_true = wav_true_pre[:, : wav_hat.shape[-1]]
-                    else:
-                        with torch.no_grad():
-                            dac_z_true = vae.decode(x1_slice)
-                            wav_true = decode_from_dac_latent(
-                                dac_z_true, DEVICE, no_grad=True
-                            )[:, : wav_hat.shape[-1]]
+            if adv_enabled and wav_hat is not None:
+                mpd_fake_g = mpd(wav_hat)
+                msd_fake_g = msd(wav_hat)
+                if CFG.dit_adv_weight > 0:
+                    loss = loss + CFG.dit_adv_weight * (
+                        gen_loss_fn(mpd_fake_g) + gen_loss_fn(msd_fake_g)
+                    )
+                if CFG.dit_fm_weight > 0:
+                    loss = loss + CFG.dit_fm_weight * (
+                        fm_loss_fn(mpd_real, mpd_fake_g)
+                        + fm_loss_fn(msd_real, msd_fake_g)
+                    )
 
-                    # Align lengths (decode may produce slightly fewer samples
-                    # than the slice suggests due to DAC output math).
-                    T_min = min(wav_hat.shape[-1], wav_true.shape[-1])
-                    wav_hat = wav_hat[:, :T_min]
-                    wav_true = wav_true[:, :T_min]
-
-                    if onset_mel_loss is not None:
-                        loss = loss + CFG.dit_onset_mel_weight * onset_mel_loss(
-                            wav_hat, wav_true
-                        )
-                    if tderiv_enabled:
-                        loss = loss + CFG.dit_tderiv_weight * temporal_derivative_loss(
-                            wav_hat, wav_true
-                        )
-            else:
-                # Fast path: pure flow-matching MSE, no aux losses.
-                loss = flow_matching_loss(
-                    dit, x1, clap_embeds,
-                    ref_z=ref_z,
-                    cfg_dropout=CFG.cfg_dropout,
-                    ref_dropout=CFG.ref_dropout,
-                )
+            if aux_enabled and wav_hat is not None:
+                if onset_mel_loss is not None:
+                    loss = loss + CFG.dit_onset_mel_weight * onset_mel_loss(
+                        wav_hat, wav_true
+                    )
+                if tderiv_enabled:
+                    loss = loss + CFG.dit_tderiv_weight * temporal_derivative_loss(
+                        wav_hat, wav_true
+                    )
 
             opt.zero_grad()
             loss.backward()
@@ -685,7 +737,7 @@ def train_dit(train_loader, val_loader, vae: DrumVAE, resume_state: dict | None 
 
         sch.step()
 
-        # --- val ---
+        # --- val (flow-matching MSE only — fast, consistent metric) ---
         dit.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -891,6 +943,34 @@ def main():
              f"Default: CFG.dit_aux_every_n ({CFG.dit_aux_every_n}).",
     )
     parser.add_argument(
+        "--dit-adv-weight",
+        type=float,
+        default=None,
+        help=f"Adversarial loss weight (MPD + MSD discriminators). Adds a "
+             f"learned 'does this sound real?' gradient signal. 0 disables. "
+             f"Typical values 1.0-4.0. The discriminator trains with a "
+             f"separate optimizer at --dit-disc-lr-mult × --lr. "
+             f"Default: CFG.dit_adv_weight ({CFG.dit_adv_weight}).",
+    )
+    parser.add_argument(
+        "--dit-fm-weight",
+        type=float,
+        default=None,
+        help=f"Feature-matching loss weight. L1 between discriminator "
+             f"intermediate features on real vs generated waveforms. More "
+             f"stable than the raw adversarial signal; typically contributes "
+             f"more to quality. 0 disables. Typical values 2.0-10.0. "
+             f"Default: CFG.dit_fm_weight ({CFG.dit_fm_weight}).",
+    )
+    parser.add_argument(
+        "--dit-disc-lr-mult",
+        type=float,
+        default=None,
+        help=f"Discriminator LR = --lr × this multiplier. Standard GAN "
+             f"practice is 2x generator LR. "
+             f"Default: CFG.dit_disc_lr_mult ({CFG.dit_disc_lr_mult}).",
+    )
+    parser.add_argument(
         "--vae-kl-weight",
         type=float,
         default=None,
@@ -1077,6 +1157,18 @@ def main():
     if args.dit_aux_every_n is not None:
         CFG.dit_aux_every_n = args.dit_aux_every_n
         print(f"[train] dit_aux_every_n: {args.dit_aux_every_n}")
+
+    if args.dit_adv_weight is not None:
+        CFG.dit_adv_weight = args.dit_adv_weight
+        print(f"[train] dit_adv_weight: {args.dit_adv_weight}")
+
+    if args.dit_fm_weight is not None:
+        CFG.dit_fm_weight = args.dit_fm_weight
+        print(f"[train] dit_fm_weight: {args.dit_fm_weight}")
+
+    if args.dit_disc_lr_mult is not None:
+        CFG.dit_disc_lr_mult = args.dit_disc_lr_mult
+        print(f"[train] dit_disc_lr_mult: {args.dit_disc_lr_mult}")
 
     # Standard multi-head attention constraint
     if CFG.dit_dim % CFG.dit_heads != 0:
